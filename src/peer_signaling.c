@@ -209,6 +209,7 @@ static void peer_signaling_on_pub_event(const char* msg, size_t size) {
         break;
       }
 
+      LOGI("Received remote SDP (answer) from %s:\n%s", g_ps.subtopic, item->valuestring);
       peer_connection_set_remote_description(g_ps.pc, item->valuestring, SDP_TYPE_ANSWER);
 
     } else if (strcmp(item->valuestring, RPC_METHOD_STATE) == 0) {
@@ -473,6 +474,7 @@ static int peer_signaling_mqtt_subscribe(int subscribed) {
 static void peer_signaling_onicecandidate(char* description, void* userdata) {
   cJSON* res;
   char* payload;
+  LOGI("Sending local SDP (offer) to %s:\n%s", g_ps.proto == 0 ? g_ps.pubtopic : g_ps.host, description);
   if (g_ps.id > 0) {
     res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "jsonrpc", RPC_VERSION);
