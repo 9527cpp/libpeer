@@ -4,7 +4,14 @@ cmake_policy(VERSION 3.16)
 include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreHTTP/httpFilePaths.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/third_party/coreMQTT/mqttFilePaths.cmake)
 
-if (DEFINED ENV{IDF_PATH})
+if(COMMAND idf_component_register)
+  set(PEER_ESP_IDF_DEFAULT ON)
+else()
+  set(PEER_ESP_IDF_DEFAULT OFF)
+endif()
+option(PEER_BUILD_ESP_IDF "Build libpeer as an ESP-IDF component" ${PEER_ESP_IDF_DEFAULT})
+
+if(PEER_BUILD_ESP_IDF)
   file(GLOB ESP32_CODES "./src/*.c")
   idf_component_register(
    SRCS ${ESP32_CODES} ${HTTP_SOURCES} ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES}
