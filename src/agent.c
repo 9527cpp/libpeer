@@ -302,6 +302,14 @@ void agent_get_local_description(Agent* agent, char* description, int length) {
   LOGD("local description:\n%s", description);
 }
 
+static void agent_pair_to_string(IceCandidatePair* pair, char* buf, size_t len) {
+  char local_addr[ADDRSTRLEN];
+  char remote_addr[ADDRSTRLEN];
+  addr_to_string(&pair->local->addr, local_addr, sizeof(local_addr));
+  addr_to_string(&pair->remote->addr, remote_addr, sizeof(remote_addr));
+  snprintf(buf, len, "%s:%d > %s:%d", local_addr, pair->local->addr.port, remote_addr, pair->remote->addr.port);
+}
+
 int agent_send(Agent* agent, const uint8_t* buf, int len) {
   return agent_socket_send(agent, &agent->nominated_pair->remote->addr, buf, len);
 }
@@ -362,16 +370,93 @@ int agent_send_binding_request(Agent* agent) {
   return ret;
 }
 
+// RFC 8445 7.3.1.3: learn the source of a valid binding request from an unknown address
+// as a peer reflexive remote candidate, and pair it with a local candidate.
+static IceCandidatePair* agent_add_peer_reflexive_candidate(Agent* agent, Address* addr) {
+  IceCandidate* remote;
+  IceCandidatePair* pair;
+  int i;
+
+  for (i = 0; i < agent->remote_candidates_count; i++) {
+    if (addr_equal(&agent->remote_candidates[i].addr, addr)) {
+      return NULL;
+    }
+  }
+
+  if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES ||
+      agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
+    LOGW("No room for peer reflexive candidate");
+    return NULL;
+  }
+
+  for (i = 0; i < agent->local_candidates_count; i++) {
+    if (agent->local_candidates[i].addr.family == addr->family) {
+      break;
+    }
+  }
+
+  if (i == agent->local_candidates_count) {
+    return NULL;
+  }
+
+  remote = &agent->remote_candidates[agent->remote_candidates_count];
+  ice_candidate_create(remote, agent->remote_candidates_count, ICE_CANDIDATE_TYPE_PRFLX, addr);
+  snprintf(remote->foundation, sizeof(remote->foundation), "prflx%d", agent->remote_candidates_count);
+  agent->remote_candidates_count++;
+
+  pair = &agent->candidate_pairs[agent->candidate_pairs_num++];
+  pair->local = &agent->local_candidates[i];
+  pair->remote = remote;
+  pair->priority = pair->local->priority + remote->priority;
+  pair->state = ICE_CANDIDATE_STATE_FROZEN;
+  pair->conncheck = 0;
+  return pair;
+}
+
+// RFC 8445 7.3.1.4: check the new peer reflexive pair right away instead of waiting in order.
+static void agent_triggered_check(Agent* agent, IceCandidatePair* pair) {
+  char pair_string[2 * ADDRSTRLEN + 16];
+
+  if (agent->nominated_pair && agent->nominated_pair->state == ICE_CANDIDATE_STATE_INPROGRESS) {
+    if (agent->nominated_pair->remote->type == ICE_CANDIDATE_TYPE_PRFLX) {
+      return;
+    }
+    agent->nominated_pair->state = ICE_CANDIDATE_STATE_FROZEN;
+  }
+
+  agent->nominated_pair = pair;
+  pair->conncheck = 0;
+  pair->state = ICE_CANDIDATE_STATE_INPROGRESS;
+  agent_pair_to_string(pair, pair_string, sizeof(pair_string));
+  LOGI("Triggered check on peer reflexive pair [%d] %s", (int)(pair - agent->candidate_pairs), pair_string);
+  agent_send_binding_request(agent);
+}
+
 void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
   StunMessage msg;
   StunHeader* header;
+  IceCandidatePair* pair;
+  char addr_string[ADDRSTRLEN];
+  addr_to_string(addr, addr_string, sizeof(addr_string));
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->local_upwd) == 0) {
+        if (agent->selected_pair == NULL) {
+          LOGI("Received binding request from %s:%d, send binding response", addr_string, addr->port);
+        } else {
+          LOGD("Received binding request from %s:%d, send binding response", addr_string, addr->port);
+        }
         header = (StunHeader*)stun_msg->buf;
         memcpy(agent->transaction_id, header->transaction_id, sizeof(header->transaction_id));
         agent_create_binding_response(agent, &msg, addr);
         agent_socket_send(agent, addr, msg.buf, msg.size);
+
+        if (agent->selected_pair == NULL && (pair = agent_add_peer_reflexive_candidate(agent, addr)) != NULL) {
+          LOGI("Add peer reflexive remote candidate %s:%d", addr_string, addr->port);
+          agent_triggered_check(agent, pair);
+        }
+      } else {
+        LOGW("Invalid binding request from %s:%d, check remote ice-ufrag/ice-pwd", addr_string, addr->port);
       }
       break;
     default:
@@ -380,15 +465,21 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
 }
 
 void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
+  char pair_string[2 * ADDRSTRLEN + 16];
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
-      if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0 &&
-          agent->binding_request_pending &&
-          memcmp(((StunHeader*)stun_msg->buf)->transaction_id,
-                 agent->binding_request_transaction_id,
-                 sizeof(agent->binding_request_transaction_id)) == 0) {
+      if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) != 0) {
+        LOGW("Invalid binding response, check remote ice-pwd");
+      } else if (!agent->binding_request_pending ||
+                 memcmp(((StunHeader*)stun_msg->buf)->transaction_id,
+                        agent->binding_request_transaction_id,
+                        sizeof(agent->binding_request_transaction_id)) != 0) {
+        LOGD("Ignore binding response with unexpected transaction id");
+      } else {
         agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
         agent->binding_request_pending = 0;
+        agent_pair_to_string(agent->nominated_pair, pair_string, sizeof(pair_string));
+        LOGI("Received binding response, pair %s succeeded", pair_string);
       }
       break;
     default:
@@ -495,8 +586,13 @@ int agent_connectivity_check(Agent* agent) {
   uint8_t buf[1400];
 
   if (agent_select_candidate_pair(agent) < 0) {
+    LOGW("All %d candidate pairs failed, restart connectivity check", agent->candidate_pairs_num);
     agent_update_candidate_pairs(agent);
     return -1;
+  }
+  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+    agent->selected_pair = agent->nominated_pair;
+    return 0;
   }
   if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
     LOGI("nominated pair is not in progress");
@@ -521,22 +617,34 @@ int agent_connectivity_check(Agent* agent) {
 
 int agent_select_candidate_pair(Agent* agent) {
   int i;
+  char pair_string[2 * ADDRSTRLEN + 16];
+  IceCandidatePair* pair = agent->nominated_pair;
+
+  // keep checking the nominated pair first, it may be a triggered check out of array order
+  if (pair != NULL && pair >= agent->candidate_pairs &&
+      pair < agent->candidate_pairs + agent->candidate_pairs_num) {
+    if (pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      return 0;
+    } else if (pair->state == ICE_CANDIDATE_STATE_INPROGRESS) {
+      pair->conncheck++;
+      if (pair->conncheck < AGENT_CONNCHECK_MAX) {
+        return 0;
+      }
+      pair->state = ICE_CANDIDATE_STATE_FAILED;
+      agent_pair_to_string(pair, pair_string, sizeof(pair_string));
+      LOGW("Candidate pair [%d] %s failed, no binding response after %d checks",
+           (int)(pair - agent->candidate_pairs), pair_string, AGENT_CONNCHECK_MAX);
+    }
+  }
+
   for (i = 0; i < agent->candidate_pairs_num; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
       // nominate this pair
       agent->nominated_pair = &agent->candidate_pairs[i];
       agent->candidate_pairs[i].conncheck = 0;
       agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
-      return 0;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
-      agent->candidate_pairs[i].conncheck++;
-      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
-        return 0;
-      }
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-      // agent->selected_pair = &agent->candidate_pairs[i];
+      agent_pair_to_string(&agent->candidate_pairs[i], pair_string, sizeof(pair_string));
+      LOGI("Checking candidate pair [%d] %s", i, pair_string);
       return 0;
     }
   }

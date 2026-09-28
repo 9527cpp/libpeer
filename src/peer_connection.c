@@ -291,6 +291,9 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
 
 int peer_connection_loop(PeerConnection* pc) {
   uint32_t ssrc = 0;
+  int ret;
+  char local_addr[ADDRSTRLEN];
+  char remote_addr[ADDRSTRLEN];
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
   switch (pc->state) {
@@ -299,9 +302,20 @@ int peer_connection_loop(PeerConnection* pc) {
 
     case PEER_CONNECTION_CHECKING:
       if (pc->agent.selected_pair) {
+        addr_to_string(&pc->agent.selected_pair->local->addr, local_addr, sizeof(local_addr));
+        addr_to_string(&pc->agent.selected_pair->remote->addr, remote_addr, sizeof(remote_addr));
+        LOGI("ICE binding succeeded, selected pair %s:%d > %s:%d, start DTLS handshake as %s",
+             local_addr, pc->agent.selected_pair->local->addr.port,
+             remote_addr, pc->agent.selected_pair->remote->addr.port,
+             pc->role == DTLS_SRTP_ROLE_SERVER ? "server" : "client");
         // if ice candidate pass the connectivity check, then we can start DTLS-SRTP handshake
-        dtls_srtp_handshake(&pc->dtls_srtp, NULL,
-                            pc->remote_fingerprint);
+        ret = dtls_srtp_handshake(&pc->dtls_srtp, NULL,
+                                  pc->remote_fingerprint);
+        if (ret == 0) {
+          LOGI("DTLS handshake succeeded");
+        } else {
+          LOGW("DTLS handshake failed: -0x%.4x, retry in next loop", (unsigned int)-ret);
+        }
       } else {
         agent_connectivity_check(&pc->agent);
       }
