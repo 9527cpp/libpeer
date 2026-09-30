@@ -28,7 +28,7 @@ libpeer is a WebRTC implementation written in C, developed with BSD socket. The 
 * [coreMQTT](https://github.com/FreeRTOS/coreMQTT)
 
 ### Getting Started with Generic Example
-- Copy URL from the test [website](https://sepfy.github.io/libpeer)
+- Copy URL from the test [website](https://9527cpp.github.io/libpeer)
 - Build and run the example
 ```bash
 $ sudo apt -y install git cmake wget ffmpeg
