@@ -31,6 +31,7 @@ struct PeerConnection {
   char sdp[CONFIG_SDP_BUFFER_SIZE];
 
   void (*onicecandidate)(char* sdp, void* user_data);
+  void (*onlocalcandidate)(char* candidate, void* user_data);
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
@@ -46,6 +47,13 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
+
+  // Trickled candidates come from the signaling thread while the agent is owned by the
+  // thread running peer_connection_loop, so they are passed through a single-producer
+  // single-consumer queue.
+  IceCandidate remote_candidate_queue[AGENT_MAX_CANDIDATES];
+  int remote_candidate_queue_head;
+  int remote_candidate_queue_tail;
 };
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
@@ -285,8 +293,42 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   return rtrn;
 }
 
+static void peer_connection_gather_server_candidates(PeerConnection* pc) {
+  int i, j, count;
+  char candidate[256];
+
+  for (i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
+    if (!pc->config.ice_servers[i].urls) {
+      continue;
+    }
+    LOGI("ice server: %s", pc->config.ice_servers[i].urls);
+    count = pc->agent.local_candidates_count;
+    agent_gather_candidate(&pc->agent, pc->config.ice_servers[i].urls, pc->config.ice_servers[i].username, pc->config.ice_servers[i].credential);
+
+    if (!pc->onlocalcandidate) {
+      continue;
+    }
+    for (j = count; j < pc->agent.local_candidates_count; j++) {
+      ice_candidate_to_description(&pc->agent.local_candidates[j], candidate, sizeof(candidate));
+      candidate[strcspn(candidate, "\r\n")] = '\0';
+      // "a=candidate:..." in SDP, "candidate:..." when trickled
+      pc->onlocalcandidate(candidate + strlen("a="), pc->config.user_data);
+    }
+  }
+}
+
 static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
   return d == DTLS_SRTP_ROLE_SERVER ? "a=setup:passive" : "a=setup:active";
+}
+
+static void peer_connection_apply_remote_candidates(PeerConnection* pc) {
+  int tail = __atomic_load_n(&pc->remote_candidate_queue_tail, __ATOMIC_RELAXED);
+
+  while (tail != __atomic_load_n(&pc->remote_candidate_queue_head, __ATOMIC_ACQUIRE)) {
+    agent_add_remote_candidate(&pc->agent, &pc->remote_candidate_queue[tail]);
+    tail = (tail + 1) % AGENT_MAX_CANDIDATES;
+    __atomic_store_n(&pc->remote_candidate_queue_tail, tail, __ATOMIC_RELEASE);
+  }
 }
 
 int peer_connection_loop(PeerConnection* pc) {
@@ -301,6 +343,7 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
+      peer_connection_apply_remote_candidates(pc);
       if (pc->agent.selected_pair) {
         addr_to_string(&pc->agent.selected_pair->local->addr, local_addr, sizeof(local_addr));
         addr_to_string(&pc->agent.selected_pair->remote->addr, remote_addr, sizeof(remote_addr));
@@ -467,6 +510,8 @@ void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, 
     return;
   }
   pc->sctp.connected = 0;
+  // drop candidates trickled for the previous session, the queue is not consumed outside CHECKING
+  pc->remote_candidate_queue_tail = pc->remote_candidate_queue_head;
 
   dtls_srtp_deinit(&pc->dtls_srtp);
   memset(&pc->dtls_srtp, 0, sizeof(pc->dtls_srtp));
@@ -495,11 +540,8 @@ void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, 
 
   agent_create_ice_credential(&pc->agent);
   agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
-  for (int i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
-    if (pc->config.ice_servers[i].urls) {
-      LOGI("ice server: %s", pc->config.ice_servers[i].urls);
-      agent_gather_candidate(&pc->agent, pc->config.ice_servers[i].urls, pc->config.ice_servers[i].username, pc->config.ice_servers[i].credential);
-    }
+  if (!pc->onlocalcandidate) {
+    peer_connection_gather_server_candidates(pc);
   }
 }
 
@@ -512,6 +554,9 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   int sdp_video = (pc->config.video_codec != CODEC_NONE) && (sdp_type == SDP_TYPE_OFFER || pc->remote_vssrc > 0);
 
   sdp_create(pc->sdp, sdp_video, sdp_audio, pc->config.datachannel);
+  if (pc->onlocalcandidate) {
+    sdp_append(pc->sdp, "a=ice-options:trickle");
+  }
   agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
 
   sdp_append(pc->sdp, "a=ice-ufrag:%s", pc->agent.local_ufrag);
@@ -559,13 +604,23 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
 }
 
 const char* peer_connection_create_offer(PeerConnection* pc) {
+  const char* sdp;
   peer_connection_set_local_description(pc, NULL, SDP_TYPE_OFFER);
-  return peer_connection_create_sdp(pc, SDP_TYPE_OFFER);
+  sdp = peer_connection_create_sdp(pc, SDP_TYPE_OFFER);
+  if (pc->onlocalcandidate) {
+    peer_connection_gather_server_candidates(pc);
+  }
+  return sdp;
 }
 
 const char* peer_connection_create_answer(PeerConnection* pc) {
+  const char* sdp;
   peer_connection_set_local_description(pc, NULL, SDP_TYPE_ANSWER);
-  return peer_connection_create_sdp(pc, SDP_TYPE_ANSWER);
+  sdp = peer_connection_create_sdp(pc, SDP_TYPE_ANSWER);
+  if (pc->onlocalcandidate) {
+    peer_connection_gather_server_candidates(pc);
+  }
+  return sdp;
 }
 
 int peer_connection_send_rtcp_pil(PeerConnection* pc, uint32_t ssrc) {
@@ -593,6 +648,10 @@ void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {
   pc->onicecandidate = onicecandidate;
+}
+
+void peer_connection_onlocalcandidate(PeerConnection* pc, void (*onlocalcandidate)(char* candidate, void* userdata)) {
+  pc->onlocalcandidate = onlocalcandidate;
 }
 
 void peer_connection_oniceconnectionstatechange(PeerConnection* pc,
@@ -631,12 +690,19 @@ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid) {
 }
 
 int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
-  Agent* agent = &pc->agent;
-  if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], candidate, candidate + strlen(candidate)) != 0) {
+  int head = __atomic_load_n(&pc->remote_candidate_queue_head, __ATOMIC_RELAXED);
+  int next = (head + 1) % AGENT_MAX_CANDIDATES;
+
+  if (next == __atomic_load_n(&pc->remote_candidate_queue_tail, __ATOMIC_ACQUIRE)) {
+    LOGW("Remote candidate queue is full, drop %s", candidate);
+    return -1;
+  }
+
+  if (ice_candidate_from_description(&pc->remote_candidate_queue[head], candidate, candidate + strlen(candidate)) != 0) {
     return -1;
   }
 
   LOGD("Add candidate: %s", candidate);
-  agent->remote_candidates_count++;
+  __atomic_store_n(&pc->remote_candidate_queue_head, next, __ATOMIC_RELEASE);
   return 0;
 }

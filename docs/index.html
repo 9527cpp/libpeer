@@ -223,15 +223,23 @@ datachannel.onmessage = (e) => {
   }  
 }
 
-pc.onicecandidate = (e) => {
-  //console.log(e)
-}
-
 // Interfaces without internet access (VPN, virtual NICs) keep ICE gathering busy until
 // their STUN requests time out (~40s), so do not wait for "complete" longer than this.
+// Only used when the device does not support trickle ICE.
 const ICE_GATHERING_TIMEOUT_MS = 2000
 let answerSent = false
 let gatheringTimer = null
+let trickle = false
+let pendingLocalCandidates = []
+
+function sendCandidate(candidate) {
+  console.log(`send candidate ${candidate}`)
+  client.publish(invokeTopic, JSON.stringify({
+    jsonrpc: "2.0",
+    method: "candidate",
+    params: candidate,
+  }))
+}
 
 function sendAnswer(reason) {
   if (answerSent || !pc.localDescription) {
@@ -247,6 +255,20 @@ function sendAnswer(reason) {
     params: pc.localDescription.sdp,
     id: answerId,
   }))
+  pendingLocalCandidates.forEach(sendCandidate)
+  pendingLocalCandidates = []
+}
+
+pc.onicecandidate = (e) => {
+  // libpeer only supports UDP candidates
+  if (!trickle || !e.candidate || !e.candidate.candidate || e.candidate.protocol !== "udp") {
+    return
+  }
+  if (answerSent) {
+    sendCandidate(e.candidate.candidate)
+  } else {
+    pendingLocalCandidates.push(e.candidate.candidate)
+  }
 }
 
 pc.onicegatheringstatechange = () => {
@@ -288,14 +310,27 @@ document.getElementById("connect").addEventListener("click", async () => {
 client.on("message", (topic, message) => {
 
   let msg = JSON.parse(message.toString())
+  if (msg.method === "candidate") {
+    console.log(`receive candidate ${msg.params}`)
+    if (msg.params) {
+      // libpeer bundles everything on one transport, so the first m-line is enough
+      pc.addIceCandidate({candidate: msg.params, sdpMLineIndex: 0})
+        .catch(e => console.error("add remote candidate failed", e));
+    }
+    return
+  }
   if (msg.id == offerId) {
     console.log(msg.result)
     answerSent = false
+    pendingLocalCandidates = []
+    trickle = /^a=ice-options:.*\btrickle\b/m.test(msg.result)
     pc.setRemoteDescription({type: "offer", sdp: msg.result})
       .then(() => pc.createAnswer())
       .then(d => pc.setLocalDescription(d))
       .then(() => {
-        if (pc.iceGatheringState === "complete") {
+        if (trickle) {
+          sendAnswer("trickle ice")
+        } else if (pc.iceGatheringState === "complete") {
           sendAnswer("gathering complete")
         } else {
           gatheringTimer = setTimeout(() => sendAnswer("gathering timeout"), ICE_GATHERING_TIMEOUT_MS)

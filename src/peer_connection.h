@@ -140,6 +140,16 @@ void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp_text, void* userdata));
 
 /**
+ * @brief Enable trickle ICE by setting the callback function to handle local candidates.
+ * When set, the local description only carries host candidates and advertises
+ * "a=ice-options:trickle". Server reflexive and relay candidates are gathered after
+ * the description is emitted and delivered one by one as "candidate:..." strings.
+ * @param A PeerConnection.
+ * @param A callback function to handle a local candidate.
+ */
+void peer_connection_onlocalcandidate(PeerConnection* pc, void (*onlocalcandidate)(char* candidate, void* userdata));
+
+/**
  * @brief Set the callback function to handle oniceconnectionstatechange event.
  * @param A PeerConnection.
  * @param A callback function to handle oniceconnectionstatechange event.
@@ -165,9 +175,10 @@ int peer_connection_lookup_sid(PeerConnection* pc, const char* label, uint16_t* 
 char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid);
 
 /**
- * @brief adds a new remote candidate to the peer connection
+ * @brief adds a new remote candidate to the peer connection, e.g. a trickled candidate.
+ * It can be called while connectivity checks are in progress.
  * @param[in] peer connection
- * @param[in] ice candidate
+ * @param[in] ice candidate, "candidate:..." or "a=candidate:..."
  */
 int peer_connection_add_ice_candidate(PeerConnection* pc, char* ice_candidate);
 

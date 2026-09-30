@@ -101,15 +101,27 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
   return ret;
 }
 
-static int agent_socket_recv_attempts(Agent* agent, Address* addr, uint8_t* buf, int len, int maxtimes) {
+// Connectivity checks from the peer may arrive on the same socket while gathering,
+// so only accept the response to our own request.
+static int agent_socket_recv_stun_response(Agent* agent, StunMessage* request, StunMessage* response) {
   int ret = -1;
   int i = 0;
-  for (i = 0; i < maxtimes; i++) {
-    if ((ret = agent_socket_recv(agent, addr, buf, len)) != 0) {
-      break;
+  StunHeader* request_header = (StunHeader*)request->buf;
+  StunHeader* response_header = (StunHeader*)response->buf;
+  for (i = 0; i < AGENT_STUN_RECV_MAXTIMES; i++) {
+    ret = agent_socket_recv(agent, NULL, response->buf, sizeof(response->buf));
+    if (ret <= 0) {
+      continue;
     }
+    if (stun_probe(response->buf, ret) == 0 &&
+        memcmp(response_header->transaction_id, request_header->transaction_id,
+               sizeof(request_header->transaction_id)) == 0) {
+      response->size = ret;
+      return ret;
+    }
+    LOGD("Ignore unexpected packet while waiting for STUN response");
   }
-  return ret;
+  return -1;
 }
 
 static int agent_socket_send(Agent* agent, Address* addr, const uint8_t* buf, int len) {
@@ -167,7 +179,7 @@ static int agent_create_stun_addr(Agent* agent, Address* serv_addr) {
     return ret;
   }
 
-  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  ret = agent_socket_recv_stun_response(agent, &send_msg, &recv_msg);
   if (ret <= 0) {
     LOGD("Failed to receive STUN Binding Response.");
     return ret;
@@ -198,7 +210,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
     return -1;
   }
 
-  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  ret = agent_socket_recv_stun_response(agent, &send_msg, &recv_msg);
   if (ret <= 0) {
     LOGD("Failed to receive STUN Binding Response.");
     return ret;
@@ -225,7 +237,7 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
     return -1;
   }
 
-  agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  ret = agent_socket_recv_stun_response(agent, &send_msg, &recv_msg);
   if (ret <= 0) {
     LOGD("Failed to receive TURN Binding Response.");
     return ret;
@@ -552,6 +564,52 @@ void agent_set_remote_description(Agent* agent, char* description) {
   LOGD("remote upwd: %s", agent->remote_upwd);
 }
 
+int agent_add_remote_candidate(Agent* agent, IceCandidate* candidate) {
+  int i;
+  IceCandidate* remote;
+  IceCandidatePair* pair;
+  char addr_string[ADDRSTRLEN];
+  char pair_string[2 * ADDRSTRLEN + 16];
+
+  for (i = 0; i < agent->remote_candidates_count; i++) {
+    if (addr_equal(&agent->remote_candidates[i].addr, &candidate->addr)) {
+      return 0;
+    }
+  }
+
+  if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES) {
+    LOGW("No room for remote candidate");
+    return -1;
+  }
+
+  remote = &agent->remote_candidates[agent->remote_candidates_count++];
+  memcpy(remote, candidate, sizeof(IceCandidate));
+
+  addr_to_string(&remote->addr, addr_string, sizeof(addr_string));
+  LOGI("Add remote candidate %s:%d", addr_string, remote->addr.port);
+
+  // append pairs instead of rebuilding them, so the check in progress is kept
+  for (i = 0; i < agent->local_candidates_count; i++) {
+    if (agent->local_candidates[i].addr.family != remote->addr.family) {
+      continue;
+    }
+    if (agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
+      LOGW("No room for candidate pair");
+      break;
+    }
+    pair = &agent->candidate_pairs[agent->candidate_pairs_num];
+    pair->local = &agent->local_candidates[i];
+    pair->remote = remote;
+    pair->priority = pair->local->priority + remote->priority;
+    pair->state = ICE_CANDIDATE_STATE_FROZEN;
+    pair->conncheck = 0;
+    agent_pair_to_string(pair, pair_string, sizeof(pair_string));
+    LOGI("[%d] %s", agent->candidate_pairs_num, pair_string);
+    agent->candidate_pairs_num++;
+  }
+  return 0;
+}
+
 void agent_update_candidate_pairs(Agent* agent) {
   int i, j;
   char local_addr_string[ADDRSTRLEN];
@@ -586,8 +644,13 @@ int agent_connectivity_check(Agent* agent) {
   uint8_t buf[1400];
 
   if (agent_select_candidate_pair(agent) < 0) {
-    LOGW("All %d candidate pairs failed, restart connectivity check", agent->candidate_pairs_num);
-    agent_update_candidate_pairs(agent);
+    // with trickle ICE there may be no pairs yet, keep answering the peer's checks
+    // so that peer reflexive candidates can still be learned
+    if (agent->candidate_pairs_num > 0) {
+      LOGW("All %d candidate pairs failed, restart connectivity check", agent->candidate_pairs_num);
+      agent_update_candidate_pairs(agent);
+    }
+    agent_recv(agent, buf, sizeof(buf));
     return -1;
   }
   if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {

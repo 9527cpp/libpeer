@@ -91,4 +91,6 @@ void agent_destroy(Agent* agent);
 
 void agent_update_candidate_pairs(Agent* agent);
 
+int agent_add_remote_candidate(Agent* agent, IceCandidate* candidate);
+
 #endif  // AGENT_H_

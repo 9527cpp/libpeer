@@ -29,6 +29,7 @@
 #define RPC_METHOD_OFFER "offer"
 #define RPC_METHOD_ANSWER "answer"
 #define RPC_METHOD_CLOSE "close"
+#define RPC_METHOD_CANDIDATE "candidate"
 
 #define RPC_ERROR_PARSE_ERROR "{\"code\":-32700,\"message\":\"Parse error\"}"
 #define RPC_ERROR_INVALID_REQUEST "{\"code\":-32600,\"message\":\"Invalid Request\"}"
@@ -172,21 +173,32 @@ static void peer_signaling_on_pub_event(const char* msg, size_t size) {
       break;
     }
 
+    item = cJSON_GetObjectItem(req, "method");
+    if (!cJSON_IsString(item)) {
+      error = cJSON_CreateRaw(RPC_ERROR_INVALID_REQUEST);
+      LOGW("Cannot find method");
+      break;
+    }
+
+    // trickled candidates are JSON-RPC notifications, which have no id and get no response
+    if (strcmp(item->valuestring, RPC_METHOD_CANDIDATE) == 0) {
+      item = cJSON_GetObjectItem(req, "params");
+      if (cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        LOGI("Received remote candidate: %s", item->valuestring);
+        peer_connection_add_ice_candidate(g_ps.pc, item->valuestring);
+      }
+      break;
+    }
+
     item = cJSON_GetObjectItem(req, "id");
-    if (!item && !cJSON_IsNumber(item)) {
+    if (!cJSON_IsNumber(item)) {
       error = cJSON_CreateRaw(RPC_ERROR_INVALID_REQUEST);
       LOGW("Cannot find id");
       break;
     }
 
     id = item->valueint;
-
     item = cJSON_GetObjectItem(req, "method");
-    if (!item && cJSON_IsString(item)) {
-      error = cJSON_CreateRaw(RPC_ERROR_INVALID_REQUEST);
-      LOGW("Cannot find method");
-      break;
-    }
 
     if (strcmp(item->valuestring, RPC_METHOD_OFFER) == 0) {
       switch (state) {
@@ -499,6 +511,22 @@ static void peer_signaling_onicecandidate(char* description, void* userdata) {
   }
 }
 
+static void peer_signaling_onlocalcandidate(char* candidate, void* userdata) {
+  cJSON* notification;
+  char* payload;
+  LOGI("Sending local candidate to %s: %s", g_ps.pubtopic, candidate);
+  notification = cJSON_CreateObject();
+  cJSON_AddStringToObject(notification, "jsonrpc", RPC_VERSION);
+  cJSON_AddStringToObject(notification, "method", RPC_METHOD_CANDIDATE);
+  cJSON_AddStringToObject(notification, "params", candidate);
+  payload = cJSON_PrintUnformatted(notification);
+  if (payload) {
+    peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
+    free(payload);
+  }
+  cJSON_Delete(notification);
+}
+
 int peer_signaling_connect(const char* url, const char* token, PeerConnection* pc) {
   char* client_id;
 
@@ -515,6 +543,8 @@ int peer_signaling_connect(const char* url, const char* token, PeerConnection* p
 
   switch (g_ps.proto) {
     case 0: {  // MQTT
+      // WHIP over HTTP has no channel for trickled candidates, so only MQTT enables it
+      peer_connection_onlocalcandidate(g_ps.pc, peer_signaling_onlocalcandidate);
       client_id = strrchr(g_ps.path, '/');
       snprintf(g_ps.client_id, sizeof(g_ps.client_id), "%s", client_id + 1);
       snprintf(g_ps.subtopic, sizeof(g_ps.subtopic), "%s/invoke", g_ps.path);
