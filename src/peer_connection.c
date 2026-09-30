@@ -512,6 +512,7 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   int sdp_video = (pc->config.video_codec != CODEC_NONE) && (sdp_type == SDP_TYPE_OFFER || pc->remote_vssrc > 0);
 
   sdp_create(pc->sdp, sdp_video, sdp_audio, pc->config.datachannel);
+  agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
 
   sdp_append(pc->sdp, "a=ice-ufrag:%s", pc->agent.local_ufrag);
   sdp_append(pc->sdp, "a=ice-pwd:%s", pc->agent.local_upwd);
@@ -527,6 +528,7 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
         sdp_append_vp8(pc->sdp);
         break;
     }
+    sdp_append(pc->sdp, description);
   }
 
   if (sdp_audio) {
@@ -542,14 +544,13 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
       default:
         break;
     }
+    sdp_append(pc->sdp, description);
   }
 
   if (pc->config.datachannel) {
     sdp_append_datachannel(pc->sdp);
+    sdp_append(pc->sdp, description);
   }
-
-  agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
-  sdp_append(pc->sdp, description);
 
   if (pc->onicecandidate) {
     pc->onicecandidate(pc->sdp, pc->config.user_data);
