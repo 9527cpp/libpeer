@@ -6,6 +6,9 @@
 
 #define SDP_ATTR_LENGTH 128
 
+// shared by all outgoing streams so that the receiver can synchronize them
+#define SDP_CNAME "libpeer"
+
 #ifndef ICE_LITE
 #define ICE_LITE 0
 #endif

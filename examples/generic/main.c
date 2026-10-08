@@ -32,6 +32,16 @@ static void onmessage(char* msg, size_t len, void* user_data, uint16_t sid) {
   }
 }
 
+static void onrequestkeyframe(void* user_data) {
+  printf("remote requests a key frame\n");
+}
+
+static void onreceiverreport(const PeerReceiverReport* report, void* user_data) {
+  printf("%s report: lost %.1f%% (%d), jitter %ums, rtt %dms, bitrate %u, target %u bps\n",
+         report->is_video ? "video" : "audio", report->fraction_lost * 100, report->cumulative_lost,
+         report->jitter_ms, report->rtt_ms, report->send_bitrate_bps, report->target_bitrate_bps);
+}
+
 static void signal_handler(int signal) {
   g_interrupted = 1;
 }
@@ -105,7 +115,8 @@ int main(int argc, char* argv[]) {
       },
       .datachannel = DATA_CHANNEL_STRING,
       .video_codec = CODEC_H264,
-      .audio_codec = CODEC_PCMA};
+      .audio_codec = CODEC_PCMA,
+      .on_request_keyframe = onrequestkeyframe};
 
   printf("=========== Parsed Arguments ===========\n");
   printf(" %-5s : %s\n", "URL", url);
@@ -116,6 +127,7 @@ int main(int argc, char* argv[]) {
   g_pc = peer_connection_create(&config);
   peer_connection_oniceconnectionstatechange(g_pc, onconnectionstatechange);
   peer_connection_ondatachannel(g_pc, onmessage, onopen, onclose);
+  peer_connection_on_receiver_report(g_pc, onreceiverreport);
 
   peer_signaling_connect(url, token, g_pc);
 

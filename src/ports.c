@@ -174,6 +174,15 @@ uint32_t ports_get_epoch_time() {
   return (uint32_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+void ports_get_ntp_time(uint32_t* seconds, uint32_t* fraction) {
+  // seconds between 1900-01-01 (NTP epoch) and 1970-01-01 (Unix epoch)
+  const uint32_t ntp_unix_offset = 2208988800UL;
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  *seconds = (uint32_t)tv.tv_sec + ntp_unix_offset;
+  *fraction = (uint32_t)(((uint64_t)tv.tv_usec << 32) / 1000000);
+}
+
 void ports_sleep_ms(int ms) {
 #if CONFIG_USE_LWIP
   sys_msleep(ms);

@@ -93,7 +93,24 @@ struct RtpEncoder {
   uint8_t buf[CONFIG_MTU + 128];
 };
 
+typedef struct RtpHistory RtpHistory;
+
 int rtp_packet_validate(uint8_t* packet, size_t size);
+
+/**
+ * @brief create a ring buffer of sent packets indexed by sequence number.
+ * Packets are put by the sending thread and read by another one without locking.
+ */
+RtpHistory* rtp_history_create(int capacity);
+
+void rtp_history_destroy(RtpHistory* history);
+
+void rtp_history_put(RtpHistory* history, uint16_t seq, const uint8_t* packet, size_t size);
+
+/**
+ * @return size of the packet copied into buf, -1 if it is no longer in the history
+ */
+int rtp_history_get(RtpHistory* history, uint16_t seq, uint8_t* buf, size_t len);
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 

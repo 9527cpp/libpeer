@@ -19,6 +19,33 @@
     pc->state = curr_state;                                           \
   }
 
+// RTCP packets built locally, without SRTCP index and authentication tag
+#define RTCP_BUFFER_SIZE 128
+
+typedef struct RtpSenderCounters {
+  uint32_t packet_count;
+  uint32_t octet_count;
+  uint32_t rtp_timestamp;
+  uint32_t last_packet_ms;
+} RtpSenderCounters;
+
+typedef struct RtpSenderStats {
+  uint32_t ssrc;
+  uint32_t clock_rate;
+  int is_video;
+
+  // written by the thread sending media and read by the thread running
+  // peer_connection_loop, an odd seqlock means the counters are being updated
+  uint32_t seqlock;
+  RtpSenderCounters counters;
+
+  // owned by the thread running peer_connection_loop
+  uint32_t last_sr_ms;
+  uint32_t report_ms;
+  uint32_t report_octet_count;
+  uint32_t send_bitrate_bps;
+} RtpSenderStats;
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
@@ -35,15 +62,24 @@ struct PeerConnection {
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
+  void (*on_receiver_report)(const PeerReceiverReport* report, void* user_data);
 
   uint8_t temp_buf[CONFIG_MTU];
   uint8_t agent_buf[CONFIG_MTU];
   int agent_ret;
+  uint8_t rtcp_buf[RTCP_BUFFER_SIZE + SRTP_MAX_TRAILER_LEN];
+  uint8_t rtx_buf[CONFIG_MTU + 32];
 
   RtpEncoder artp_encoder;
   RtpEncoder vrtp_encoder;
   RtpDecoder vrtp_decoder;
   RtpDecoder artp_decoder;
+
+  RtpSenderStats astats;
+  RtpSenderStats vstats;
+  // sent SRTP video packets for NACK retransmission
+  RtpHistory* video_history;
+  int pli_pending;
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
@@ -56,15 +92,208 @@ struct PeerConnection {
   int remote_candidate_queue_tail;
 };
 
+static void rtp_sender_stats_init(RtpSenderStats* stats, uint32_t ssrc, uint32_t clock_rate, int is_video) {
+  memset(stats, 0, sizeof(*stats));
+  stats->ssrc = ssrc;
+  stats->clock_rate = clock_rate;
+  stats->is_video = is_video;
+}
+
+static void rtp_sender_stats_update(RtpSenderStats* stats, size_t payload_size, uint32_t rtp_timestamp) {
+  uint32_t seqlock = stats->seqlock;
+
+  __atomic_store_n(&stats->seqlock, seqlock + 1, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  stats->counters.packet_count++;
+  stats->counters.octet_count += payload_size;
+  stats->counters.rtp_timestamp = rtp_timestamp;
+  stats->counters.last_packet_ms = ports_get_epoch_time();
+  __atomic_store_n(&stats->seqlock, seqlock + 2, __ATOMIC_RELEASE);
+}
+
+static void rtp_sender_stats_read(RtpSenderStats* stats, RtpSenderCounters* counters) {
+  uint32_t seqlock;
+
+  do {
+    seqlock = __atomic_load_n(&stats->seqlock, __ATOMIC_ACQUIRE);
+    *counters = stats->counters;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  } while ((seqlock & 1) || seqlock != __atomic_load_n(&stats->seqlock, __ATOMIC_RELAXED));
+}
+
+static uint32_t peer_connection_clock_rate(MediaCodec codec) {
+  switch (codec) {
+    case CODEC_OPUS:
+      return 48000;
+    case CODEC_PCMA:
+    case CODEC_PCMU:
+      return 8000;
+    default:
+      return 90000;
+  }
+}
+
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
+  RtpHeader* header = (RtpHeader*)data;
+  uint32_t ssrc = ntohl(header->ssrc);
+  uint16_t seq = ntohs(header->seq_number);
+  uint32_t timestamp = ntohl(header->timestamp);
+  RtpSenderStats* stats = NULL;
   int packet_len = (int)size;
 
   if (dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, &packet_len) != 0) {
     return;
   }
 
+  if (ssrc == pc->vstats.ssrc) {
+    stats = &pc->vstats;
+    rtp_history_put(pc->video_history, seq, data, packet_len);
+  } else if (ssrc == pc->astats.ssrc) {
+    stats = &pc->astats;
+  }
+
   agent_send(&pc->agent, data, packet_len);
+
+  if (stats) {
+    rtp_sender_stats_update(stats, size - sizeof(RtpHeader), timestamp);
+  }
+}
+
+static int peer_connection_send_rtcp(PeerConnection* pc, uint8_t* packet, int len) {
+  if (dtls_srtp_encrypt_rtcp_packet(&pc->dtls_srtp, packet, &len) != 0) {
+    LOGW("Failed to encrypt RTCP packet");
+    return -1;
+  }
+  return agent_send(&pc->agent, packet, len);
+}
+
+static void peer_connection_send_sr(PeerConnection* pc, RtpSenderStats* stats, uint32_t now) {
+  RtpSenderCounters counters;
+  RtcpSenderInfo info;
+  int len;
+
+  if (stats->ssrc == 0 || (uint32_t)(now - stats->last_sr_ms) < CONFIG_RTCP_SR_INTERVAL) {
+    return;
+  }
+
+  rtp_sender_stats_read(stats, &counters);
+  if (counters.packet_count == 0) {
+    return;
+  }
+  stats->last_sr_ms = now;
+
+  info.ssrc = stats->ssrc;
+  ports_get_ntp_time(&info.ntp_seconds, &info.ntp_fraction);
+  // the RTP timestamp corresponding to the NTP timestamp, extrapolated from the last packet
+  info.rtp_timestamp = counters.rtp_timestamp +
+                       (uint32_t)((uint64_t)(uint32_t)(now - counters.last_packet_ms) * stats->clock_rate / 1000);
+  info.packet_count = counters.packet_count;
+  info.octet_count = counters.octet_count;
+
+  len = rtcp_get_sr(pc->rtcp_buf, RTCP_BUFFER_SIZE, &info, SDP_CNAME);
+  if (len > 0 && peer_connection_send_rtcp(pc, pc->rtcp_buf, len) > 0) {
+    LOGD("Sent SR ssrc=%" PRIu32 " packets=%" PRIu32 " octets=%" PRIu32,
+         info.ssrc, info.packet_count, info.octet_count);
+  }
+}
+
+static void peer_connection_send_pli(PeerConnection* pc) {
+  int len;
+
+  if (pc->remote_vssrc == 0) {
+    return;
+  }
+
+  len = rtcp_get_pli(pc->rtcp_buf, RTCP_BUFFER_SIZE, pc->vstats.ssrc, pc->remote_vssrc);
+  if (len > 0 && peer_connection_send_rtcp(pc, pc->rtcp_buf, len) > 0) {
+    LOGI("Sent PLI to ssrc=%" PRIu32, pc->remote_vssrc);
+  }
+}
+
+static uint32_t peer_connection_target_bitrate(uint32_t send_bitrate_bps, float fraction_lost) {
+  if (fraction_lost < 0.02f) {
+    return (uint32_t)(send_bitrate_bps * 1.08f);
+  } else if (fraction_lost <= 0.1f) {
+    return send_bitrate_bps;
+  }
+  return (uint32_t)(send_bitrate_bps * (1.0f - 0.5f * fraction_lost));
+}
+
+static void peer_connection_incoming_report_block(PeerConnection* pc, RtcpReportBlock* block) {
+  uint32_t ssrc = ntohl(block->ssrc);
+  uint32_t flcnpl = ntohl(block->flcnpl);
+  uint32_t lsr = ntohl(block->lsr);
+  uint32_t dlsr = ntohl(block->dlsr);
+  uint32_t now = ports_get_epoch_time();
+  uint32_t ntp_seconds, ntp_fraction, rtt;
+  RtpSenderStats* stats;
+  RtpSenderCounters counters;
+  PeerReceiverReport report;
+
+  if (ssrc == pc->vstats.ssrc) {
+    stats = &pc->vstats;
+  } else if (ssrc == pc->astats.ssrc) {
+    stats = &pc->astats;
+  } else {
+    return;
+  }
+
+  memset(&report, 0, sizeof(report));
+  report.ssrc = ssrc;
+  report.is_video = stats->is_video;
+  report.fraction_lost = (flcnpl >> 24) / 256.0f;
+  // 24 bits signed integer
+  report.cumulative_lost = (int32_t)(flcnpl << 8) >> 8;
+  report.jitter_ms = (uint32_t)((uint64_t)ntohl(block->jitter) * 1000 / stats->clock_rate);
+
+  report.rtt_ms = -1;
+  if (lsr != 0) {
+    // middle 32 bits of the NTP timestamp, in units of 1/65536 seconds
+    ports_get_ntp_time(&ntp_seconds, &ntp_fraction);
+    rtt = ((ntp_seconds << 16) | (ntp_fraction >> 16)) - lsr - dlsr;
+    report.rtt_ms = (int32_t)rtt < 0 ? 0 : (int32_t)(((uint64_t)rtt * 1000) >> 16);
+  }
+
+  // receivers may send reports along with every feedback, measure over a reasonable period
+  rtp_sender_stats_read(stats, &counters);
+  if (stats->report_ms == 0) {
+    stats->report_ms = now;
+    stats->report_octet_count = counters.octet_count;
+  } else if ((uint32_t)(now - stats->report_ms) >= 500) {
+    stats->send_bitrate_bps = (uint32_t)((uint64_t)(uint32_t)(counters.octet_count - stats->report_octet_count) * 8 * 1000 /
+                                         (uint32_t)(now - stats->report_ms));
+    stats->report_ms = now;
+    stats->report_octet_count = counters.octet_count;
+  }
+  report.send_bitrate_bps = stats->send_bitrate_bps;
+  report.target_bitrate_bps = peer_connection_target_bitrate(stats->send_bitrate_bps, report.fraction_lost);
+
+  LOGD("RTCP report ssrc=%" PRIu32 " lost=%.3f/%" PRId32 " jitter=%" PRIu32 "ms rtt=%" PRId32 "ms bitrate=%" PRIu32 " target=%" PRIu32,
+       report.ssrc, report.fraction_lost, report.cumulative_lost, report.jitter_ms, report.rtt_ms,
+       report.send_bitrate_bps, report.target_bitrate_bps);
+
+  if (pc->on_receiver_report) {
+    pc->on_receiver_report(&report, pc->config.user_data);
+  }
+
+  if (pc->on_receiver_packet_loss && report.fraction_lost > 0) {
+    pc->on_receiver_packet_loss(report.fraction_lost, (uint32_t)report.cumulative_lost, pc->config.user_data);
+  }
+}
+
+static void peer_connection_retransmit_rtp_packet(uint16_t seq, void* user_data) {
+  PeerConnection* pc = (PeerConnection*)user_data;
+  int len = rtp_history_get(pc->video_history, seq, pc->rtx_buf, sizeof(pc->rtx_buf));
+
+  if (len < 0) {
+    LOGD("NACK seq=%u is not in history", seq);
+    return;
+  }
+
+  // the packet was protected already, resending it as is avoids SRTP replay protection
+  agent_send(&pc->agent, pc->rtx_buf, len);
+  LOGD("Retransmitted seq=%u", seq);
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
@@ -100,40 +329,47 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
 
 static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
   RtcpHeader* rtcp_header;
+  RtcpReportBlock* blocks;
+  RtcpFb* fb;
   size_t pos = 0;
+  size_t packet_len;
+  int i, count, fmt;
 
-  while (pos < len) {
+  while (pos + sizeof(RtcpHeader) <= len) {
     rtcp_header = (RtcpHeader*)(buf + pos);
+    packet_len = 4 * ((size_t)ntohs(rtcp_header->length) + 1);
+    if (rtcp_header_version(rtcp_header) != 2 || pos + packet_len > len) {
+      LOGW("Invalid RTCP packet, type=%d offset=%zu len=%zu", rtcp_header->type, pos, len);
+      break;
+    }
 
+    fmt = rtcp_header_rc(rtcp_header);
     switch (rtcp_header->type) {
+      case RTCP_SR:
       case RTCP_RR:
-        LOGD("RTCP_PR");
-        if (rtcp_header_rc(rtcp_header) > 0) {
-// TODO: REMB, GCC ...etc
-#if 0
-          RtcpRr rtcp_rr = rtcp_parse_rr(buf);
-          uint32_t fraction = ntohl(rtcp_rr.report_block[0].flcnpl) >> 24;
-          uint32_t total = ntohl(rtcp_rr.report_block[0].flcnpl) & 0x00FFFFFF;
-          if(pc->on_receiver_packet_loss && fraction > 0) {
-
-            pc->on_receiver_packet_loss((float)fraction/256.0, total, pc->config.user_data);
-          }
-#endif
+        count = rtcp_get_report_blocks(buf + pos, packet_len, &blocks);
+        for (i = 0; i < count; i++) {
+          peer_connection_incoming_report_block(pc, &blocks[i]);
         }
         break;
-      case RTCP_PSFB: {
-        int fmt = rtcp_header_rc(rtcp_header);
+      case RTCP_RTPFB:
+        fb = (RtcpFb*)rtcp_header;
+        if (fmt == RTCP_RTPFB_NACK && packet_len >= 12 && ntohl(fb->media) == pc->vstats.ssrc && pc->video_history) {
+          count = rtcp_parse_nack(buf + pos, packet_len, peer_connection_retransmit_rtp_packet, pc);
+          LOGD("RTCP NACK %d packets", count);
+        }
+        break;
+      case RTCP_PSFB:
         LOGD("RTCP_PSFB %d", fmt);
-        // PLI and FIR
-        if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
+        if ((fmt == RTCP_PSFB_PLI || fmt == RTCP_PSFB_FIR) && pc->config.on_request_keyframe) {
           pc->config.on_request_keyframe(pc->config.user_data);
         }
-      }
+        break;
       default:
         break;
     }
 
-    pos += 4 * ntohs(rtcp_header->length) + 4;
+    pos += packet_len;
   }
 }
 
@@ -182,6 +418,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
     rtp_decoder_init(&pc->artp_decoder, pc->config.audio_codec,
                      pc->config.onaudiotrack, pc->config.user_data);
+
+    rtp_sender_stats_init(&pc->astats, pc->artp_encoder.ssrc, peer_connection_clock_rate(pc->config.audio_codec), 0);
   }
 
   if (pc->config.video_codec) {
@@ -190,6 +428,9 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
     rtp_decoder_init(&pc->vrtp_decoder, pc->config.video_codec,
                      pc->config.onvideotrack, pc->config.user_data);
+
+    rtp_sender_stats_init(&pc->vstats, pc->vrtp_encoder.ssrc, peer_connection_clock_rate(pc->config.video_codec), 1);
+    pc->video_history = rtp_history_create(CONFIG_RTP_HISTORY_SIZE);
   }
 
   return pc;
@@ -200,6 +441,7 @@ void peer_connection_destroy(PeerConnection* pc) {
     sctp_destroy_association(&pc->sctp);
     dtls_srtp_deinit(&pc->dtls_srtp);
     agent_destroy(&pc->agent);
+    rtp_history_destroy(pc->video_history);
     free(pc);
     pc = NULL;
   }
@@ -365,6 +607,16 @@ int peer_connection_loop(PeerConnection* pc) {
 
       if (pc->dtls_srtp.state == DTLS_SRTP_STATE_CONNECTED) {
         LOGD("DTLS-SRTP handshake done");
+        // media is not sent before CONNECTED, so nothing races with this thread here
+        if (pc->astats.ssrc) {
+          dtls_srtp_add_outbound_stream(&pc->dtls_srtp, pc->astats.ssrc);
+          rtp_sender_stats_init(&pc->astats, pc->astats.ssrc, pc->astats.clock_rate, 0);
+        }
+        if (pc->vstats.ssrc) {
+          dtls_srtp_add_outbound_stream(&pc->dtls_srtp, pc->vstats.ssrc);
+          rtp_sender_stats_init(&pc->vstats, pc->vstats.ssrc, pc->vstats.clock_rate, 1);
+        }
+        __atomic_store_n(&pc->pli_pending, 0, __ATOMIC_RELAXED);
         if (pc->config.datachannel) {
           LOGI("Creating SCTP association");
           sctp_create_association(&pc->sctp, &pc->dtls_srtp);
@@ -380,8 +632,11 @@ int peer_connection_loop(PeerConnection* pc) {
 
         if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTCP packet");
-          dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-          peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
+          if ((ret = dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret)) != 0) {
+            LOGW("Failed to decrypt RTCP packet: %d", ret);
+          } else {
+            peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
+          }
 
         } else if (dtls_srtp_probe(pc->agent_buf)) {
           int ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
@@ -394,10 +649,10 @@ int peer_connection_loop(PeerConnection* pc) {
         } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTP packet");
 
-          dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-
           ssrc = rtp_get_ssrc(pc->agent_buf);
-          if (ssrc == pc->remote_assrc) {
+          if ((ret = dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret)) != 0) {
+            LOGD("Failed to decrypt RTP packet: %d", ret);
+          } else if (ssrc == pc->remote_assrc) {
             rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
           } else if (ssrc == pc->remote_vssrc) {
             rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
@@ -406,6 +661,16 @@ int peer_connection_loop(PeerConnection* pc) {
         } else {
           LOGW("Unknown data");
         }
+      }
+
+      if (__atomic_exchange_n(&pc->pli_pending, 0, __ATOMIC_RELAXED)) {
+        peer_connection_send_pli(pc);
+      }
+
+      {
+        uint32_t now = ports_get_epoch_time();
+        peer_connection_send_sr(pc, &pc->vstats, now);
+        peer_connection_send_sr(pc, &pc->astats, now);
       }
 
 #if CONFIG_STUN_KEEPALIVE_INTERVAL > 0
@@ -623,17 +888,12 @@ const char* peer_connection_create_answer(PeerConnection* pc) {
   return sdp;
 }
 
-int peer_connection_send_rtcp_pil(PeerConnection* pc, uint32_t ssrc) {
-  int ret = -1;
-  uint8_t plibuf[128];
-  rtcp_get_pli(plibuf, 12, ssrc);
-
-  // TODO: encrypt rtcp packet
-  // guint size = 12;
-  // dtls_transport_encrypt_rctp_packet(pc->dtls_transport, plibuf, &size);
-  // ret = nice_agent_send(pc->nice_agent, pc->stream_id, pc->component_id, size, (gchar*)plibuf);
-
-  return ret;
+int peer_connection_request_keyframe(PeerConnection* pc) {
+  if (pc->remote_vssrc == 0) {
+    return -1;
+  }
+  __atomic_store_n(&pc->pli_pending, 1, __ATOMIC_RELAXED);
+  return 0;
 }
 
 // callbacks
@@ -644,6 +904,11 @@ void peer_connection_on_connected(PeerConnection* pc, void (*on_connected)(void*
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata)) {
   pc->on_receiver_packet_loss = on_receiver_packet_loss;
+}
+
+void peer_connection_on_receiver_report(PeerConnection* pc,
+                                        void (*on_receiver_report)(const PeerReceiverReport* report, void* userdata)) {
+  pc->on_receiver_report = on_receiver_report;
 }
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {

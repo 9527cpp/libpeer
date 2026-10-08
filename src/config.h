@@ -74,6 +74,17 @@
 #define CONFIG_AUDIO_DURATION 20
 #endif
 
+// interval of RTCP sender reports for each outgoing stream
+#ifndef CONFIG_RTCP_SR_INTERVAL
+#define CONFIG_RTCP_SR_INTERVAL 1000
+#endif
+
+// number of sent video packets kept for NACK retransmission, 0 to disable.
+// each slot takes about CONFIG_MTU bytes, 128 slots cover ~1s of 1Mbps video.
+#ifndef CONFIG_RTP_HISTORY_SIZE
+#define CONFIG_RTP_HISTORY_SIZE 128
+#endif
+
 #ifndef CONFIG_MAX_NALU_SIZE
 #define CONFIG_MAX_NALU_SIZE (100 * 1024)  // 100KB
 #endif

@@ -80,6 +80,18 @@ typedef struct PeerConfiguration {
 
 } PeerConfiguration;
 
+typedef struct PeerReceiverReport {
+  uint32_t ssrc;            // local SSRC of the reported stream
+  int is_video;
+  float fraction_lost;      // since the previous report, 0.0 ~ 1.0
+  int32_t cumulative_lost;  // packets lost since the beginning
+  uint32_t jitter_ms;       // interarrival jitter
+  int32_t rtt_ms;           // round trip time, -1 if the remote has not received a SR yet
+  uint32_t send_bitrate_bps;    // measured since the previous report, 0 if unknown
+  uint32_t target_bitrate_bps;  // suggested encoder bitrate based on packet loss, 0 if unknown
+
+} PeerReceiverReport;
+
 typedef struct PeerConnection PeerConnection;
 
 const char* peer_connection_state_to_string(PeerConnectionState state);
@@ -130,6 +142,25 @@ const char* peer_connection_create_answer(PeerConnection* pc);
  */
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata));
+
+/**
+ * @brief register callback function to handle RTCP receiver reports of outgoing streams.
+ * The callback is called by the thread running peer_connection_loop.
+ * target_bitrate_bps follows a loss-based rule: increase by 8% when loss < 2%,
+ * hold when loss is 2% ~ 10%, otherwise decrease by loss / 2.
+ * @param[in] peer connection
+ * @param[in] callback function
+ */
+void peer_connection_on_receiver_report(PeerConnection* pc,
+                                        void (*on_receiver_report)(const PeerReceiverReport* report, void* userdata));
+
+/**
+ * @brief request a key frame of the incoming video by sending a RTCP PLI.
+ * It can be called from any thread, the PLI is sent by the thread running peer_connection_loop.
+ * @param[in] peer connection
+ * @return 0 if requested, -1 if there is no incoming video
+ */
+int peer_connection_request_keyframe(PeerConnection* pc);
 
 /**
  * @brief Set the callback function to handle onicecandidate event.

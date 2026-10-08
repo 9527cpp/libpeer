@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "address.h"
@@ -33,6 +34,90 @@ typedef struct FuHeader {
 #define NALU_START_CODE_SIZE 4
 #define NALU_HEADER_SIZE 1
 #define FU_HEADER_SIZE 1
+
+// a packet with SRTP authentication tag
+#define RTP_HISTORY_PACKET_SIZE (CONFIG_MTU + 32)
+#define RTP_HISTORY_SEQ_WRITING UINT32_MAX
+
+typedef struct RtpHistorySlot {
+  uint32_t seq;  // RTP_HISTORY_SEQ_WRITING while the packet is being replaced
+  uint16_t size;
+  uint8_t packet[RTP_HISTORY_PACKET_SIZE];
+} RtpHistorySlot;
+
+struct RtpHistory {
+  int capacity;
+  RtpHistorySlot slots[];
+};
+
+RtpHistory* rtp_history_create(int capacity) {
+  RtpHistory* history;
+  int i;
+
+  if (capacity <= 0) {
+    return NULL;
+  }
+
+  history = malloc(sizeof(RtpHistory) + capacity * sizeof(RtpHistorySlot));
+  if (history == NULL) {
+    LOGW("Failed to allocate RTP history of %d packets", capacity);
+    return NULL;
+  }
+
+  history->capacity = capacity;
+  for (i = 0; i < capacity; i++) {
+    history->slots[i].seq = RTP_HISTORY_SEQ_WRITING;
+  }
+  return history;
+}
+
+void rtp_history_destroy(RtpHistory* history) {
+  free(history);
+}
+
+// seqlock: the reader detects a slot overwritten during its copy by checking seq again
+void rtp_history_put(RtpHistory* history, uint16_t seq, const uint8_t* packet, size_t size) {
+  RtpHistorySlot* slot;
+
+  if (history == NULL || size > RTP_HISTORY_PACKET_SIZE) {
+    return;
+  }
+
+  slot = &history->slots[seq % history->capacity];
+  __atomic_store_n(&slot->seq, RTP_HISTORY_SEQ_WRITING, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  memcpy(slot->packet, packet, size);
+  slot->size = size;
+  __atomic_store_n(&slot->seq, seq, __ATOMIC_RELEASE);
+}
+
+int rtp_history_get(RtpHistory* history, uint16_t seq, uint8_t* buf, size_t len) {
+  RtpHistorySlot* slot;
+  uint32_t seq_before;
+  uint16_t size;
+
+  if (history == NULL) {
+    return -1;
+  }
+
+  slot = &history->slots[seq % history->capacity];
+  seq_before = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
+  if (seq_before != seq) {
+    return -1;
+  }
+
+  size = slot->size;
+  if (size > len) {
+    return -1;
+  }
+  memcpy(buf, slot->packet, size);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+  if (__atomic_load_n(&slot->seq, __ATOMIC_RELAXED) != seq_before) {
+    return -1;
+  }
+  return size;
+}
 
 int rtp_packet_validate(uint8_t* packet, size_t size) {
   if (size < 12)
