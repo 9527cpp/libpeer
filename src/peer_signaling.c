@@ -36,6 +36,21 @@
 #define RPC_ERROR_METHOD_NOT_FOUND "{\"code\":-32601,\"message\":\"Method not found\"}"
 #define RPC_ERROR_INVALID_PARAMS "{\"code\":-32602,\"message\":\"Invalid params\"}"
 #define RPC_ERROR_INTERNAL_ERROR "{\"code\":-32603,\"message\":\"Internal error\"}"
+#define RPC_ERROR_BUSY "{\"code\":-32000,\"message\":\"Too many connections\"}"
+
+#define SESSION_ID_MAX_LEN 32
+// "<path>/invoke" without a session id, used by clients that do not support sessions
+#define LEGACY_SESSION_ID ""
+
+// A browser picks a random session id and talks on "<path>/<session id>/invoke" and
+// "<path>/<session id>/result", so that every browser gets its own peer connection.
+typedef struct PeerSignalingSession {
+  int bound;
+  char id[SESSION_ID_MAX_LEN];
+  PeerConnection* pc;
+  uint32_t bound_time;
+  int rpc_id;  // id of the pending offer request
+} PeerSignalingSession;
 
 typedef struct PeerSignaling {
   MQTTContext_t mqtt_ctx;
@@ -48,10 +63,9 @@ typedef struct PeerSignaling {
   uint8_t http_buf[CONFIG_HTTP_BUFFER_SIZE];
 
   char subtopic[TOPIC_MAX_LEN];
-  char pubtopic[TOPIC_MAX_LEN];
+  char session_subtopic[TOPIC_MAX_LEN];
 
   uint16_t packet_id;
-  int id;
 
   int proto;  // 0: MQTT, 1: HTTP
   int port;
@@ -60,7 +74,11 @@ typedef struct PeerSignaling {
   char token[TOKEN_MAX_LEN];
   char client_id[32];
 
-  PeerConnection* pc;
+  PeerSignalingSession sessions[CONFIG_SIGNALING_MAX_SESSIONS];
+  int sessions_count;
+  // the session whose peer connection is creating a description, callbacks of the peer
+  // connection are invoked synchronously inside peer_connection_create_offer()
+  PeerSignalingSession* current;
 
 } PeerSignaling;
 
@@ -136,16 +154,26 @@ static int peer_signaling_resolve_url(const char* url, char* host, int* port, ch
   return proto;
 }
 
-static void peer_signaling_mqtt_publish(MQTTContext_t* mqtt_ctx, const char* message) {
+static void peer_signaling_pubtopic(const char* session_id, char* topic, size_t size) {
+  if (strlen(session_id) == 0) {
+    snprintf(topic, size, "%s/result", g_ps.path);
+  } else {
+    snprintf(topic, size, "%s/%s/result", g_ps.path, session_id);
+  }
+}
+
+static void peer_signaling_mqtt_publish(MQTTContext_t* mqtt_ctx, const char* session_id, const char* message) {
   MQTTStatus_t status;
   MQTTPublishInfo_t pub_info;
+  char topic[TOPIC_MAX_LEN + SESSION_ID_MAX_LEN];
 
+  peer_signaling_pubtopic(session_id, topic, sizeof(topic));
   memset(&pub_info, 0, sizeof(pub_info));
 
   pub_info.qos = MQTTQoS0;
   pub_info.retain = false;
-  pub_info.pTopicName = g_ps.pubtopic;
-  pub_info.topicNameLength = strlen(g_ps.pubtopic);
+  pub_info.pTopicName = topic;
+  pub_info.topicNameLength = strlen(topic);
   pub_info.pPayload = message;
   pub_info.payloadLength = strlen(message);
 
@@ -157,16 +185,63 @@ static void peer_signaling_mqtt_publish(MQTTContext_t* mqtt_ctx, const char* mes
   }
 }
 
-static void peer_signaling_on_pub_event(const char* msg, size_t size) {
+static PeerSignalingSession* peer_signaling_find_session(const char* session_id) {
+  int i;
+
+  for (i = 0; i < g_ps.sessions_count; i++) {
+    if (g_ps.sessions[i].bound && strcmp(g_ps.sessions[i].id, session_id) == 0) {
+      return &g_ps.sessions[i];
+    }
+  }
+  return NULL;
+}
+
+static int peer_signaling_session_is_idle(PeerSignalingSession* session) {
+  switch (peer_connection_get_state(session->pc)) {
+    case PEER_CONNECTION_NEW:
+      // an offer was sent but the answer never came back
+      return !session->bound ||
+             (uint32_t)(ports_get_epoch_time() - session->bound_time) >= CONFIG_SIGNALING_SESSION_TIMEOUT;
+    case PEER_CONNECTION_DISCONNECTED:
+    case PEER_CONNECTION_FAILED:
+    case PEER_CONNECTION_CLOSED:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+static PeerSignalingSession* peer_signaling_bind_session(const char* session_id) {
+  PeerSignalingSession* session;
+  int i;
+
+  for (i = 0; i < g_ps.sessions_count; i++) {
+    session = &g_ps.sessions[i];
+    if (!session->bound || peer_signaling_session_is_idle(session)) {
+      if (session->bound) {
+        LOGI("Release session \"%s\" of peer connection %d", session->id, i);
+      }
+      session->bound = 1;
+      snprintf(session->id, sizeof(session->id), "%s", session_id);
+      session->bound_time = ports_get_epoch_time();
+      LOGI("Bind session \"%s\" to peer connection %d", session_id, i);
+      return session;
+    }
+  }
+  return NULL;
+}
+
+static void peer_signaling_on_pub_event(const char* session_id, const char* msg, size_t size) {
   cJSON *req, *res, *item, *result, *error;
   int id = -1;
   char* payload = NULL;
+  PeerSignalingSession* session;
   PeerConnectionState state;
 
   req = res = item = result = error = NULL;
-  state = peer_connection_get_state(g_ps.pc);
+  session = peer_signaling_find_session(session_id);
   do {
-    req = cJSON_Parse(msg);
+    req = cJSON_ParseWithLength(msg, size);
     if (!req) {
       error = cJSON_CreateRaw(RPC_ERROR_PARSE_ERROR);
       LOGW("Parse json failed");
@@ -183,9 +258,9 @@ static void peer_signaling_on_pub_event(const char* msg, size_t size) {
     // trickled candidates are JSON-RPC notifications, which have no id and get no response
     if (strcmp(item->valuestring, RPC_METHOD_CANDIDATE) == 0) {
       item = cJSON_GetObjectItem(req, "params");
-      if (cJSON_IsString(item) && strlen(item->valuestring) > 0) {
-        LOGI("Received remote candidate: %s", item->valuestring);
-        peer_connection_add_ice_candidate(g_ps.pc, item->valuestring);
+      if (session && cJSON_IsString(item) && strlen(item->valuestring) > 0) {
+        LOGI("Received remote candidate from session \"%s\": %s", session_id, item->valuestring);
+        peer_connection_add_ice_candidate(session->pc, item->valuestring);
       }
       break;
     }
@@ -201,34 +276,50 @@ static void peer_signaling_on_pub_event(const char* msg, size_t size) {
     item = cJSON_GetObjectItem(req, "method");
 
     if (strcmp(item->valuestring, RPC_METHOD_OFFER) == 0) {
-      switch (state) {
-        case PEER_CONNECTION_NEW:
-        case PEER_CONNECTION_DISCONNECTED:
-        case PEER_CONNECTION_FAILED:
-        case PEER_CONNECTION_CLOSED: {
-          g_ps.id = id;
-          peer_connection_create_offer(g_ps.pc);
-        } break;
-        default: {
-          error = cJSON_CreateRaw(RPC_ERROR_INTERNAL_ERROR);
-        } break;
+      if (session == NULL) {
+        session = peer_signaling_bind_session(session_id);
+      } else if (!peer_signaling_session_is_idle(session) && peer_connection_get_state(session->pc) != PEER_CONNECTION_NEW) {
+        // the session is negotiating or connected
+        session = NULL;
       }
+
+      if (session == NULL) {
+        LOGW("No peer connection available for session \"%s\"", session_id);
+        error = cJSON_CreateRaw(RPC_ERROR_BUSY);
+        break;
+      }
+
+      session->rpc_id = id;
+      session->bound_time = ports_get_epoch_time();
+      g_ps.current = session;
+      peer_connection_create_offer(session->pc);
+      g_ps.current = NULL;
+
     } else if (strcmp(item->valuestring, RPC_METHOD_ANSWER) == 0) {
       item = cJSON_GetObjectItem(req, "params");
-      if (!item && !cJSON_IsString(item)) {
+      if (!cJSON_IsString(item)) {
         error = cJSON_CreateRaw(RPC_ERROR_INVALID_PARAMS);
         LOGW("Cannot find params");
         break;
       }
+      if (session == NULL) {
+        error = cJSON_CreateRaw(RPC_ERROR_INVALID_REQUEST);
+        LOGW("Answer from unknown session \"%s\"", session_id);
+        break;
+      }
 
-      LOGI("Received remote SDP (answer) from %s:\n%s", g_ps.subtopic, item->valuestring);
-      peer_connection_set_remote_description(g_ps.pc, item->valuestring, SDP_TYPE_ANSWER);
+      LOGI("Received remote SDP (answer) from session \"%s\":\n%s", session_id, item->valuestring);
+      peer_connection_set_remote_description(session->pc, item->valuestring, SDP_TYPE_ANSWER);
 
     } else if (strcmp(item->valuestring, RPC_METHOD_STATE) == 0) {
+      state = session ? peer_connection_get_state(session->pc) : PEER_CONNECTION_NEW;
       result = cJSON_CreateString(peer_connection_state_to_string(state));
 
     } else if (strcmp(item->valuestring, RPC_METHOD_CLOSE) == 0) {
-      peer_connection_close(g_ps.pc);
+      if (session) {
+        peer_connection_close(session->pc);
+        session->bound = 0;
+      }
       result = cJSON_CreateString("");
 
     } else {
@@ -252,7 +343,7 @@ static void peer_signaling_on_pub_event(const char* msg, size_t size) {
     payload = cJSON_PrintUnformatted(res);
 
     if (payload) {
-      peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
+      peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, session_id, payload);
       free(payload);
     }
     cJSON_Delete(res);
@@ -354,8 +445,38 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int 
       hostname, path, res.pHeaders, res.statusCode, res.pBody);
 
   if (res.statusCode == 201) {
-    peer_connection_set_remote_description(g_ps.pc, (const char*)res.pBody, SDP_TYPE_ANSWER);
+    peer_connection_set_remote_description(g_ps.sessions[0].pc, (const char*)res.pBody, SDP_TYPE_ANSWER);
   }
+  return 0;
+}
+
+// "<path>/invoke" -> "", "<path>/<session id>/invoke" -> "<session id>", otherwise -1
+static int peer_signaling_parse_session_id(const char* topic, size_t topic_len, char* session_id, size_t size) {
+  size_t path_len = strlen(g_ps.path);
+  size_t suffix_len = strlen("/invoke");
+  size_t id_len;
+
+  if (topic_len < path_len + suffix_len ||
+      strncmp(topic, g_ps.path, path_len) != 0 ||
+      strncmp(topic + topic_len - suffix_len, "/invoke", suffix_len) != 0) {
+    return -1;
+  }
+
+  if (topic_len == path_len + suffix_len) {
+    snprintf(session_id, size, "%s", LEGACY_SESSION_ID);
+    return 0;
+  }
+
+  // "/<session id>"
+  if (topic[path_len] != '/') {
+    return -1;
+  }
+  id_len = topic_len - path_len - 1 - suffix_len;
+  if (id_len == 0 || id_len >= size || memchr(topic + path_len + 1, '/', id_len) != NULL) {
+    return -1;
+  }
+  memcpy(session_id, topic + path_len + 1, id_len);
+  session_id[id_len] = '\0';
   return 0;
 }
 
@@ -363,13 +484,21 @@ static void peer_signaling_mqtt_event_cb(MQTTContext_t* mqtt_ctx,
                                          MQTTPacketInfo_t* packet_info,
                                          MQTTDeserializedInfo_t* deserialized_info) {
   MQTTStatus_t status = MQTTSuccess;
+  MQTTPublishInfo_t* pub_info;
+  char session_id[SESSION_ID_MAX_LEN];
+
   switch (packet_info->type) {
     case MQTT_PACKET_TYPE_PUBLISH:
-      LOGD("MQTT received message: %.*s",
-           deserialized_info->pPublishInfo->payloadLength,
-           (char*)deserialized_info->pPublishInfo->pPayload);
-      peer_signaling_on_pub_event(deserialized_info->pPublishInfo->pPayload,
-                                  deserialized_info->pPublishInfo->payloadLength);
+      pub_info = deserialized_info->pPublishInfo;
+      LOGD("MQTT received message from %.*s: %.*s",
+           pub_info->topicNameLength, pub_info->pTopicName,
+           pub_info->payloadLength, (char*)pub_info->pPayload);
+      if (peer_signaling_parse_session_id(pub_info->pTopicName, pub_info->topicNameLength,
+                                          session_id, sizeof(session_id)) != 0) {
+        LOGW("Ignore message from topic %.*s", pub_info->topicNameLength, pub_info->pTopicName);
+        break;
+      }
+      peer_signaling_on_pub_event(session_id, pub_info->pPayload, pub_info->payloadLength);
       break;
     case MQTT_PACKET_TYPE_SUBACK: {
       size_t ncodes = 0;
@@ -379,10 +508,8 @@ static void peer_signaling_mqtt_event_cb(MQTTContext_t* mqtt_ctx,
 
       assert(status == MQTTSuccess);
 
-      assert(ncodes == 1);
-
       for (i = 0; i < ncodes; i++) {
-        if (codes[0] == MQTTSubAckFailure) {
+        if (codes[i] == MQTTSubAckFailure) {
           LOGE("MQTT Subscription failed. Please check authorization");
           break;
         }
@@ -453,20 +580,23 @@ static int peer_signaling_mqtt_connect(const char* hostname, int port) {
 
 static int peer_signaling_mqtt_subscribe(int subscribed) {
   MQTTStatus_t status = MQTTSuccess;
-  MQTTSubscribeInfo_t sub_info;
+  MQTTSubscribeInfo_t sub_info[2];
 
   uint16_t packet_id = MQTT_GetPacketId(&g_ps.mqtt_ctx);
 
-  memset(&sub_info, 0, sizeof(sub_info));
-  sub_info.qos = MQTTQoS0;
-  sub_info.pTopicFilter = g_ps.subtopic;
-  sub_info.topicFilterLength = strlen(g_ps.subtopic);
+  memset(sub_info, 0, sizeof(sub_info));
+  sub_info[0].qos = MQTTQoS0;
+  sub_info[0].pTopicFilter = g_ps.subtopic;
+  sub_info[0].topicFilterLength = strlen(g_ps.subtopic);
+  sub_info[1].qos = MQTTQoS0;
+  sub_info[1].pTopicFilter = g_ps.session_subtopic;
+  sub_info[1].topicFilterLength = strlen(g_ps.session_subtopic);
 
   if (subscribed) {
-    LOGI("Subscribing topic %s", g_ps.subtopic);
-    status = MQTT_Subscribe(&g_ps.mqtt_ctx, &sub_info, 1, packet_id);
+    LOGI("Subscribing topic %s and %s", g_ps.subtopic, g_ps.session_subtopic);
+    status = MQTT_Subscribe(&g_ps.mqtt_ctx, sub_info, 2, packet_id);
   } else {
-    status = MQTT_Unsubscribe(&g_ps.mqtt_ctx, &sub_info, 1, packet_id);
+    status = MQTT_Unsubscribe(&g_ps.mqtt_ctx, sub_info, 2, packet_id);
   }
   if (status != MQTTSuccess) {
     LOGE("MQTT_Subscribe failed: Status=%s.", MQTT_Status_strerror(status));
@@ -486,20 +616,26 @@ static int peer_signaling_mqtt_subscribe(int subscribed) {
 static void peer_signaling_onicecandidate(char* description, void* userdata) {
   cJSON* res;
   char* payload;
-  LOGI("Sending local SDP (offer) to %s:\n%s", g_ps.proto == 0 ? g_ps.pubtopic : g_ps.host, description);
-  if (g_ps.id > 0) {
+  PeerSignalingSession* session = g_ps.current;
+
+  if (g_ps.proto == 0) {
+    if (session == NULL) {
+      LOGW("Drop local SDP created outside of the signaling");
+      return;
+    }
+    LOGI("Sending local SDP (offer) to session \"%s\":\n%s", session->id, description);
     res = cJSON_CreateObject();
     cJSON_AddStringToObject(res, "jsonrpc", RPC_VERSION);
-    cJSON_AddNumberToObject(res, "id", g_ps.id);
+    cJSON_AddNumberToObject(res, "id", session->rpc_id);
     cJSON_AddStringToObject(res, "result", description);
     payload = cJSON_PrintUnformatted(res);
     if (payload) {
-      peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
+      peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, session->id, payload);
       free(payload);
     }
     cJSON_Delete(res);
-    g_ps.id = 0;
   } else {
+    LOGI("Sending local SDP (offer) to %s:\n%s", g_ps.host, description);
     if (strlen(g_ps.token) > 0) {
       char cred[TOKEN_MAX_LEN + 10];
       memset(cred, 0, sizeof(cred));
@@ -514,21 +650,37 @@ static void peer_signaling_onicecandidate(char* description, void* userdata) {
 static void peer_signaling_onlocalcandidate(char* candidate, void* userdata) {
   cJSON* notification;
   char* payload;
-  LOGI("Sending local candidate to %s: %s", g_ps.pubtopic, candidate);
+  PeerSignalingSession* session = g_ps.current;
+
+  if (session == NULL) {
+    LOGW("Drop local candidate created outside of the signaling");
+    return;
+  }
+  LOGI("Sending local candidate to session \"%s\": %s", session->id, candidate);
   notification = cJSON_CreateObject();
   cJSON_AddStringToObject(notification, "jsonrpc", RPC_VERSION);
   cJSON_AddStringToObject(notification, "method", RPC_METHOD_CANDIDATE);
   cJSON_AddStringToObject(notification, "params", candidate);
   payload = cJSON_PrintUnformatted(notification);
   if (payload) {
-    peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
+    peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, session->id, payload);
     free(payload);
   }
   cJSON_Delete(notification);
 }
 
 int peer_signaling_connect(const char* url, const char* token, PeerConnection* pc) {
+  return peer_signaling_connect_multi(url, token, &pc, 1);
+}
+
+int peer_signaling_connect_multi(const char* url, const char* token, PeerConnection** pcs, int count) {
   char* client_id;
+  int i;
+
+  if (count <= 0 || count > CONFIG_SIGNALING_MAX_SESSIONS) {
+    LOGE("Invalid number of peer connections %d, the maximum is %d", count, CONFIG_SIGNALING_MAX_SESSIONS);
+    return -1;
+  }
 
   if ((g_ps.proto = peer_signaling_resolve_url(url, g_ps.host, &g_ps.port, g_ps.path)) < 0) {
     LOGE("Resolve URL failed");
@@ -538,23 +690,34 @@ int peer_signaling_connect(const char* url, const char* token, PeerConnection* p
     strncpy(g_ps.token, token, sizeof(g_ps.token));
   }
 
-  g_ps.pc = pc;
-  peer_connection_onicecandidate(g_ps.pc, peer_signaling_onicecandidate);
+  memset(g_ps.sessions, 0, sizeof(g_ps.sessions));
+  g_ps.sessions_count = count;
+  for (i = 0; i < count; i++) {
+    g_ps.sessions[i].pc = pcs[i];
+    peer_connection_onicecandidate(pcs[i], peer_signaling_onicecandidate);
+    if (g_ps.proto == 0) {
+      // WHIP over HTTP has no channel for trickled candidates, so only MQTT enables it
+      peer_connection_onlocalcandidate(pcs[i], peer_signaling_onlocalcandidate);
+    }
+  }
 
   switch (g_ps.proto) {
     case 0: {  // MQTT
-      // WHIP over HTTP has no channel for trickled candidates, so only MQTT enables it
-      peer_connection_onlocalcandidate(g_ps.pc, peer_signaling_onlocalcandidate);
       client_id = strrchr(g_ps.path, '/');
       snprintf(g_ps.client_id, sizeof(g_ps.client_id), "%s", client_id + 1);
       snprintf(g_ps.subtopic, sizeof(g_ps.subtopic), "%s/invoke", g_ps.path);
-      snprintf(g_ps.pubtopic, sizeof(g_ps.pubtopic), "%s/result", g_ps.path);
+      snprintf(g_ps.session_subtopic, sizeof(g_ps.session_subtopic), "%s/+/invoke", g_ps.path);
       if (peer_signaling_mqtt_connect(g_ps.host, g_ps.port) == 0) {
         peer_signaling_mqtt_subscribe(1);
       }
     } break;
     case 1: {  // HTTP
-      peer_connection_create_offer(g_ps.pc);
+      if (count > 1) {
+        LOGW("Only the first peer connection is used with HTTP signaling");
+      }
+      g_ps.current = &g_ps.sessions[0];
+      peer_connection_create_offer(pcs[0]);
+      g_ps.current = NULL;
     } break;
     default: {
     } break;

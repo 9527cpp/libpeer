@@ -579,6 +579,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
   sctp->tsn = 1234;
+  sctp->stream_count = 0;
   sctp->outgoing_stream_count = 0;
   memset(sctp->outgoing_streams, 0, sizeof(sctp->outgoing_streams));
 #if CONFIG_USE_USRSCTP
@@ -709,11 +710,16 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 void sctp_destroy_association(Sctp* sctp) {
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
-    usrsctp_shutdown(sctp->sock, SHUT_RDWR);
+    // SO_LINGER with zero timeout aborts the association right away, so usrsctp does not
+    // send anything through the DTLS session afterwards
     usrsctp_close(sctp->sock);
+    usrsctp_deregister_address(sctp);
     sctp->sock = NULL;
   }
 #endif
+  if (sctp) {
+    sctp->connected = 0;
+  }
 }
 
 int sctp_is_connected(Sctp* sctp) {

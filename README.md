@@ -42,9 +42,9 @@ $ ffmpeg -i sample.mp4 \
     -x264-params bframes=0:keyint=25:min-keyint=25:scenecut=0:repeat-headers=1 \
     -f h264 test.264 \
     -map 0:a:0 -ac 1 -ar 8000 -c:a pcm_alaw -f wav test.wav
-$ ./build/examples/generic/sample -u <URL>
+$ ./build/examples/generic/sample -u <URL> [-n <max viewers>]
 ```
-- Click Connect button on the website
+- Click Connect button on the website, up to `-n` browsers (default 1) can watch at the same time
 
 ### Examples for Platforms
 - [ESP32](https://github.com/sepfy/libpeer/tree/main/examples/esp32): MJPEG over datachannel

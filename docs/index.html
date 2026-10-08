@@ -91,8 +91,11 @@
 const queryString = window.location.search
 const urlParams = new URLSearchParams(queryString)
 const deviceId = urlParams.get("id")
-const resultTopic = "/public/" + deviceId + "/result"
-const invokeTopic = "/public/" + deviceId + "/invoke"
+// every page talks on its own session topics so that the device can serve several browsers,
+// add "&legacy" to the URL for devices built before sessions were supported
+const sessionId = urlParams.has("legacy") ? "" : "/" + Math.random().toString(36).slice(2, 10)
+const resultTopic = "/public/" + deviceId + sessionId + "/result"
+const invokeTopic = "/public/" + deviceId + sessionId + "/invoke"
 const client  = mqtt.connect('wss://broker.emqx.io:8084/mqtt')
 
 function getRandomItem(array) {
@@ -317,6 +320,11 @@ client.on("message", (topic, message) => {
       pc.addIceCandidate({candidate: msg.params, sdpMLineIndex: 0})
         .catch(e => console.error("add remote candidate failed", e));
     }
+    return
+  }
+  if (msg.id == offerId && msg.error) {
+    console.error("offer request failed", msg.error)
+    document.getElementById("status").innerHTML = msg.error.message
     return
   }
   if (msg.id == offerId) {

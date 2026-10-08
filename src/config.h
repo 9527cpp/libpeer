@@ -74,6 +74,22 @@
 #define CONFIG_AUDIO_DURATION 20
 #endif
 
+// a connected peer is considered gone when nothing is received from it for this long, 0 to disable.
+// browsers send ICE consent checks every ~5s even when no media flows.
+#ifndef CONFIG_PEER_CONNECTION_IDLE_TIMEOUT
+#define CONFIG_PEER_CONNECTION_IDLE_TIMEOUT 15000
+#endif
+
+// maximum number of peer connections served by the signaling at the same time
+#ifndef CONFIG_SIGNALING_MAX_SESSIONS
+#define CONFIG_SIGNALING_MAX_SESSIONS 8
+#endif
+
+// a session that requested an offer but did not complete the negotiation is released after this time
+#ifndef CONFIG_SIGNALING_SESSION_TIMEOUT
+#define CONFIG_SIGNALING_SESSION_TIMEOUT 30000
+#endif
+
 // interval of RTCP sender reports for each outgoing stream
 #ifndef CONFIG_RTCP_SR_INTERVAL
 #define CONFIG_RTCP_SR_INTERVAL 1000

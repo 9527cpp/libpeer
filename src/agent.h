@@ -53,6 +53,8 @@ struct Agent {
   uint32_t binding_request_sent_time;
   uint8_t binding_request_transaction_id[12];
   int binding_request_pending;
+  // time of the last packet received from any address, including STUN
+  uint32_t last_recv_time;
 
   AgentMode mode;
 

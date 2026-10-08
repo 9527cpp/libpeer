@@ -21,6 +21,10 @@ void agent_clear_candidates(Agent* agent) {
   agent->local_candidates_count = 0;
   agent->remote_candidates_count = 0;
   agent->candidate_pairs_num = 0;
+  // the pairs pointed to belong to the previous session
+  agent->selected_pair = NULL;
+  agent->nominated_pair = NULL;
+  agent->binding_request_pending = 0;
 }
 
 int agent_create(Agent* agent) {
@@ -503,7 +507,10 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
   int ret = -1;
   StunMessage stun_msg;
   Address addr;
-  if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0 && stun_probe(buf, len) == 0) {
+  if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0) {
+    agent->last_recv_time = ports_get_epoch_time();
+  }
+  if (ret > 0 && stun_probe(buf, len) == 0) {
     memcpy(stun_msg.buf, buf, ret);
     stun_msg.size = ret;
     stun_parse_msg_buf(&stun_msg);

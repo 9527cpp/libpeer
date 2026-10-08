@@ -13,10 +13,12 @@
 #include "sctp.h"
 #include "sdp.h"
 
-#define STATE_CHANGED(pc, curr_state)                                 \
-  if (pc->oniceconnectionstatechange && pc->state != curr_state) {    \
-    pc->oniceconnectionstatechange(curr_state, pc->config.user_data); \
-    pc->state = curr_state;                                           \
+#define STATE_CHANGED(pc, curr_state)                                   \
+  if (pc->state != curr_state) {                                        \
+    if (pc->oniceconnectionstatechange) {                               \
+      pc->oniceconnectionstatechange(curr_state, pc->config.user_data); \
+    }                                                                   \
+    pc->state = curr_state;                                             \
   }
 
 // RTCP packets built locally, without SRTCP index and authentication tag
@@ -617,6 +619,7 @@ int peer_connection_loop(PeerConnection* pc) {
           rtp_sender_stats_init(&pc->vstats, pc->vstats.ssrc, pc->vstats.clock_rate, 1);
         }
         __atomic_store_n(&pc->pli_pending, 0, __ATOMIC_RELAXED);
+        pc->agent.last_recv_time = ports_get_epoch_time();
         if (pc->config.datachannel) {
           LOGI("Creating SCTP association");
           sctp_create_association(&pc->sctp, &pc->dtls_srtp);
@@ -672,6 +675,14 @@ int peer_connection_loop(PeerConnection* pc) {
         peer_connection_send_sr(pc, &pc->vstats, now);
         peer_connection_send_sr(pc, &pc->astats, now);
       }
+
+#if CONFIG_PEER_CONNECTION_IDLE_TIMEOUT > 0
+      if ((uint32_t)(ports_get_epoch_time() - pc->agent.last_recv_time) >= CONFIG_PEER_CONNECTION_IDLE_TIMEOUT) {
+        LOGW("Nothing received from the remote peer for %d ms", CONFIG_PEER_CONNECTION_IDLE_TIMEOUT);
+        STATE_CHANGED(pc, PEER_CONNECTION_DISCONNECTED);
+        break;
+      }
+#endif
 
 #if CONFIG_STUN_KEEPALIVE_INTERVAL > 0
       {
@@ -774,16 +785,22 @@ void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, 
   if (pc->state == PEER_CONNECTION_CONNECTED) {
     return;
   }
-  pc->sctp.connected = 0;
+  // abort the association of the previous session while its DTLS session is still alive
+  sctp_destroy_association(&pc->sctp);
   // drop candidates trickled for the previous session, the queue is not consumed outside CHECKING
   pc->remote_candidate_queue_tail = pc->remote_candidate_queue_head;
 
   dtls_srtp_deinit(&pc->dtls_srtp);
   memset(&pc->dtls_srtp, 0, sizeof(pc->dtls_srtp));
+  // a new negotiation after the previous session was disconnected, closed or failed
+  STATE_CHANGED(pc, PEER_CONNECTION_NEW);
 
   switch (sdp_type) {
     case SDP_TYPE_OFFER:
       pc->role = DTLS_SRTP_ROLE_SERVER;
+      // the remote tracks of the previous session are not valid for the new answer
+      pc->remote_assrc = 0;
+      pc->remote_vssrc = 0;
       agent_clear_candidates(&pc->agent);
       pc->agent.mode = AGENT_MODE_CONTROLLING;
       break;
