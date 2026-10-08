@@ -310,6 +310,19 @@ document.getElementById("connect").addEventListener("click", async () => {
   }))
 })
 
+// Browsers send nothing to the remote peer when a tab is closed, so tell the device
+// to release the connection now instead of waiting for its idle timeout.
+window.addEventListener("pagehide", () => {
+  if (pc.connectionState === "new" || pc.connectionState === "closed") {
+    return
+  }
+  client.publish(invokeTopic, JSON.stringify({
+    jsonrpc: "2.0",
+    method: "close",
+    id: closeId,
+  }))
+})
+
 client.on("message", (topic, message) => {
 
   let msg = JSON.parse(message.toString())

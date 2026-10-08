@@ -450,7 +450,7 @@ void peer_connection_destroy(PeerConnection* pc) {
 }
 
 void peer_connection_close(PeerConnection* pc) {
-  pc->state = PEER_CONNECTION_CLOSED;
+  STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
 }
 
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t len) {
