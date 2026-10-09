@@ -7,6 +7,19 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.2/dist/zephyr/bootstrap.min.css">
   <title>libpeer test</title>
 <style>
+.stats-overlay {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font: 12px/1.4 monospace;
+  text-align: left;
+  white-space: pre;
+  border-radius: 4px;
+  pointer-events: none;
+}
 </style>
 </head>
 <body>
@@ -35,10 +48,10 @@
         <div class="col-1">
           <p class="h5 mb-0">URL:</p>
         </div>
-        <div class="col-7">
+        <div class="col-6">
           <p class="h5 mb-0" id="device-url"></p>
         </div>
-        <div class="col-3 d-flex align-items-center gap-4">
+        <div class="col-5 d-flex flex-wrap align-items-center justify-content-end gap-3">
 	  <div class="form-check form-switch">
             <input class="form-check-input" type="checkbox" id="camera-switch">
             <label class="form-check-label" for="switch1">Camera</label>
@@ -46,6 +59,10 @@
         <div class="form-check form-switch">
             <input class="form-check-input" type="checkbox" id="microphone-switch">
             <label class="form-check-label" for="switch2">Microphone</label>
+        </div>
+        <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="stats-switch" checked>
+            <label class="form-check-label" for="stats-switch">Stats</label>
         </div>
           <button class="btn btn-outline-dark" id="connect">Connect</button>
         </div>
@@ -63,10 +80,13 @@
       <div class="col-md-6">
         <div class="p-3 border bg-light text-center">
           <h5>Video</h5>
-          <video controls id="video-stream" class="w-100" style="max-height: 400px; display: none">
-            <p>Your browser does not support the video element.</p>
-          </video>
-          <img id="img-stream" class="w-100">
+          <div class="position-relative">
+            <video controls id="video-stream" class="w-100" style="max-height: 400px; display: none">
+              <p>Your browser does not support the video element.</p>
+            </video>
+            <img id="img-stream" class="w-100">
+            <div id="stats-overlay" class="stats-overlay" hidden></div>
+          </div>
         </div>
       </div>
 
@@ -322,6 +342,129 @@ window.addEventListener("pagehide", () => {
     id: closeId,
   }))
 })
+
+const STATS_INTERVAL_MS = 1000
+let lastStats = null
+
+function fmtBitrate(bps) {
+  if (bps === undefined) return "-"
+  return bps >= 1e6 ? `${(bps / 1e6).toFixed(2)} Mbps` : `${Math.round(bps / 1e3)} kbps`
+}
+
+function fmtMs(seconds) {
+  return seconds === undefined ? "-" : `${(seconds * 1000).toFixed(1)} ms`
+}
+
+function fmtPercent(ratio) {
+  return ratio === undefined ? "-" : `${(ratio * 100).toFixed(1)}%`
+}
+
+function fmtCount(value) {
+  return value === undefined ? "-" : value
+}
+
+function delta(s, field) {
+  const prev = lastStats && lastStats.get(s.id)
+  if (!prev || s[field] === undefined || prev[field] === undefined) return undefined
+  return s[field] - prev[field]
+}
+
+function perSecond(s, field) {
+  const d = delta(s, field)
+  if (d === undefined) return undefined
+  const dt = (s.timestamp - lastStats.get(s.id).timestamp) / 1000
+  return dt > 0 ? d / dt : undefined
+}
+
+function bitrate(s, bytesField) {
+  const value = perSecond(s, bytesField)
+  return fmtBitrate(value === undefined ? undefined : value * 8)
+}
+
+function fps(s, framesField) {
+  const value = s.framesPerSecond !== undefined ? s.framesPerSecond : perSecond(s, framesField)
+  return value === undefined ? "- fps" : `${Math.round(value)} fps`
+}
+
+function videoInfo(report, s) {
+  const codec = s.codecId && report.get(s.codecId)
+  const name = codec ? codec.mimeType.split("/")[1] : "-"
+  const size = s.frameWidth ? `${s.frameWidth}x${s.frameHeight}` : "-"
+  return `${name} ${size}`
+}
+
+function inboundLines(report, s) {
+  const lost = delta(s, "packetsLost")
+  const received = delta(s, "packetsReceived")
+  let loss
+  if (lost !== undefined && received !== undefined && lost + received > 0) {
+    loss = Math.max(lost, 0) / (Math.max(lost, 0) + received)
+  }
+  const emitted = delta(s, "jitterBufferEmittedCount")
+  const bufferDelay = emitted > 0 ? delta(s, "jitterBufferDelay") / emitted : undefined
+  return [
+    `recv  ${videoInfo(report, s)}  ${fps(s, "framesDecoded")}  ${bitrate(s, "bytesReceived")}`,
+    `      jitter ${fmtMs(s.jitter)}  buffer ${fmtMs(bufferDelay)}  loss ${fmtPercent(loss)} (total ${fmtCount(s.packetsLost)})`,
+    `      nack ${fmtCount(s.nackCount)}  pli ${fmtCount(s.pliCount)}  dropped ${fmtCount(s.framesDropped)}  freezes ${fmtCount(s.freezeCount)}`,
+  ]
+}
+
+function outboundLines(report, s) {
+  let remote
+  report.forEach(r => {
+    if (r.type === "remote-inbound-rtp" && r.localId === s.id) remote = r
+  })
+  const lines = [
+    `send  ${videoInfo(report, s)}  ${fps(s, "framesEncoded")}  ${bitrate(s, "bytesSent")}` +
+      (s.targetBitrate ? `  target ${fmtBitrate(s.targetBitrate)}` : ""),
+    `      nack ${fmtCount(s.nackCount)}  pli ${fmtCount(s.pliCount)}  limit ${s.qualityLimitationReason || "-"}`,
+  ]
+  // filled from the receiver reports sent back by the device
+  if (remote) {
+    lines.push(`      remote rtt ${fmtMs(remote.roundTripTime)}  jitter ${fmtMs(remote.jitter)}  loss ${fmtPercent(remote.fractionLost)}`)
+  }
+  return lines
+}
+
+function linkLine(report) {
+  let pair
+  report.forEach(s => {
+    if (s.type === "transport" && s.selectedCandidatePairId) pair = report.get(s.selectedCandidatePairId)
+  })
+  if (!pair) {
+    report.forEach(s => {
+      if (s.type === "candidate-pair" && (s.selected || (s.nominated && s.state === "succeeded"))) pair = s
+    })
+  }
+  if (!pair) return null
+  const local = report.get(pair.localCandidateId)
+  const remote = report.get(pair.remoteCandidateId)
+  const route = local && remote ? `  ${local.candidateType} -> ${remote.candidateType}` : ""
+  return `link  rtt ${fmtMs(pair.currentRoundTripTime)}  bwe ${fmtBitrate(pair.availableOutgoingBitrate)}${route}`
+}
+
+async function updateStats() {
+  const overlay = document.getElementById("stats-overlay")
+  if (!document.getElementById("stats-switch").checked || pc.connectionState !== "connected") {
+    overlay.hidden = true
+    lastStats = null
+    return
+  }
+  const report = await pc.getStats()
+  const lines = []
+  report.forEach(s => {
+    if (s.kind !== "video") return
+    if (s.type === "inbound-rtp") lines.push(...inboundLines(report, s))
+    else if (s.type === "outbound-rtp") lines.push(...outboundLines(report, s))
+  })
+  const link = linkLine(report)
+  if (link) lines.push(link)
+  lastStats = report
+  overlay.textContent = lines.join("\n")
+  overlay.hidden = lines.length === 0
+}
+
+setInterval(() => updateStats().catch(e => console.error("get stats failed", e)), STATS_INTERVAL_MS)
 
 client.on("message", (topic, message) => {
 
