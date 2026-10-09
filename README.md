@@ -42,9 +42,17 @@ $ ffmpeg -i sample.mp4 \
     -x264-params bframes=0:keyint=25:min-keyint=25:scenecut=0:repeat-headers=1 \
     -f h264 test.264 \
     -map 0:a:0 -ac 1 -ar 8000 -c:a pcm_alaw -f wav test.wav
-$ ./build/examples/generic/sample -u <URL> [-n <max viewers>]
+$ ./build/examples/generic/sample -u <URL> [-n <max viewers>] [-s <ICE server>]... [-r]
 ```
 - Click Connect button on the website, up to `-n` browsers (default 1) can watch at the same time
+- `-s` sets the ICE servers, `stun:<host>:<port>` or `turn:<host>:<port>,<username>,<credential>`, can be repeated up to 5 times, `none` for host candidates only. The default is `stun:stun.l.google.com:19302`
+- `-r` saves the video received from viewer N to `recv_peerN.h264`
+- To use your own servers, add these parameters to the website URL
+  - `broker`: MQTT over WebSocket URL, default `wss://broker.emqx.io:8084/mqtt`. Run the example with `-u mqtts://<broker host>/public/<id>`, libpeer only connects to MQTT over TLS
+  - `ice`: same format as `-s`, can be repeated
+  - `relay`: only use TURN relayed candidates
+
+  e.g. `?id=mydevice&broker=ws://192.168.1.10:8083/mqtt&ice=turn:192.168.1.10:3478,user,pass`
 
 ### Examples for Platforms
 - [ESP32](https://github.com/sepfy/libpeer/tree/main/examples/esp32): MJPEG over datachannel

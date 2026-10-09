@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -9,6 +10,8 @@
 #include "reader.h"
 
 #define MAX_PEERS 8
+#define MAX_ICE_SERVERS (int)(sizeof(((PeerConfiguration*)0)->ice_servers) / sizeof(IceServer))
+#define DEFAULT_ICE_SERVER "stun:stun.l.google.com:19302"
 
 typedef struct Peer {
   int index;
@@ -22,6 +25,8 @@ int g_interrupted = 0;
 Peer g_peers[MAX_PEERS];
 int g_peers_count = 1;
 int g_record = 0;
+IceServer g_ice_servers[MAX_ICE_SERVERS];
+int g_ice_servers_count = -1;  // -1: not set on the command line
 
 static void onconnectionstatechange(PeerConnectionState state, void* user_data) {
   Peer* peer = (Peer*)user_data;
@@ -107,8 +112,37 @@ static uint64_t get_timestamp() {
 }
 
 void print_usage(const char* prog_name) {
-  printf("Usage: %s -u <url> [-t <token>] [-n <max peers, 1 ~ %d>] [-r]\n", prog_name, MAX_PEERS);
+  printf("Usage: %s -u <url> [-t <token>] [-n <max peers, 1 ~ %d>] [-s <ice server>]... [-r]\n", prog_name, MAX_PEERS);
+  printf("  -u  signaling URL, mqtts://<host>[:<port>]/<path> (MQTT over TLS) or http(s)://... (WHIP)\n");
+  printf("  -s  stun:<host>:<port> or turn:<host>:<port>,<username>,<credential>, repeat up to %d times,\n",
+         MAX_ICE_SERVERS);
+  printf("      \"none\" for host candidates only, default %s\n", DEFAULT_ICE_SERVER);
   printf("  -r  save the video received from peer N to recv_peerN.h264\n");
+}
+
+// "<url>[,<username>,<credential>]", the argument is split in place
+static int parse_ice_server(char* arg, IceServer* server) {
+  char* sep;
+
+  memset(server, 0, sizeof(*server));
+  server->urls = arg;
+  if ((sep = strchr(arg, ',')) != NULL) {
+    *sep = '\0';
+    server->username = sep + 1;
+    if ((sep = strchr(sep + 1, ',')) == NULL) {
+      return -1;
+    }
+    *sep = '\0';
+    server->credential = sep + 1;
+  }
+
+  if (strncmp(arg, "stun:", 5) == 0) {
+    return 0;
+  }
+  if (strncmp(arg, "turn:", 5) == 0 && server->username != NULL) {
+    return 0;
+  }
+  return -1;
 }
 
 void parse_arguments(int argc, char* argv[], const char** url, const char** token, int* count) {
@@ -123,6 +157,20 @@ void parse_arguments(int argc, char* argv[], const char** url, const char** toke
       *token = argv[++i];
     } else if (strcmp(argv[i], "-n") == 0 && (i + 1) < argc) {
       *count = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "-s") == 0 && (i + 1) < argc) {
+      if (g_ice_servers_count < 0) {
+        g_ice_servers_count = 0;
+      }
+      i++;
+      if (strcmp(argv[i], "none") == 0) {
+        continue;
+      }
+      if (g_ice_servers_count >= MAX_ICE_SERVERS || parse_ice_server(argv[i], &g_ice_servers[g_ice_servers_count]) != 0) {
+        printf("Invalid or too many ICE servers: %s\n", argv[i]);
+        print_usage(argv[0]);
+        exit(1);
+      }
+      g_ice_servers_count++;
     } else if (strcmp(argv[i], "-r") == 0) {
       g_record = 1;
     } else {
@@ -134,6 +182,11 @@ void parse_arguments(int argc, char* argv[], const char** url, const char** toke
   if (*url == NULL || *count < 1 || *count > MAX_PEERS) {
     print_usage(argv[0]);
     exit(1);
+  }
+
+  if (g_ice_servers_count < 0) {
+    g_ice_servers[0].urls = DEFAULT_ICE_SERVER;
+    g_ice_servers_count = 1;
   }
 }
 
@@ -162,19 +215,24 @@ int main(int argc, char* argv[]) {
   signal(SIGINT, signal_handler);
 
   PeerConfiguration config = {
-      .ice_servers = {
-          {.urls = "stun:stun.l.google.com:19302"},
-      },
       .datachannel = DATA_CHANNEL_STRING,
       .video_codec = CODEC_H264,
       .audio_codec = CODEC_PCMA,
       .onvideotrack = onvideotrack,
       .on_request_keyframe = onrequestkeyframe};
+  memcpy(config.ice_servers, g_ice_servers, sizeof(g_ice_servers));
 
   printf("=========== Parsed Arguments ===========\n");
   printf(" %-5s : %s\n", "URL", url);
   printf(" %-5s : %s\n", "Token", token ? token : "");
   printf(" %-5s : %d\n", "Peers", g_peers_count);
+  for (i = 0; i < g_ice_servers_count; i++) {
+    printf(" %-5s : %s%s%s\n", "ICE", g_ice_servers[i].urls,
+           g_ice_servers[i].username ? ", user " : "", g_ice_servers[i].username ? g_ice_servers[i].username : "");
+  }
+  if (g_ice_servers_count == 0) {
+    printf(" %-5s : none\n", "ICE");
+  }
   printf("========================================\n");
 
   peer_init();

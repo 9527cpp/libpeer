@@ -108,15 +108,34 @@
 
 <script>
 
+// URL parameters:
+//   id      device id, the device runs with -u mqtts://<broker host>/public/<id>
+//   broker  MQTT over WebSocket URL, default wss://broker.emqx.io:8084/mqtt
+//   ice     stun:<host>:<port> or turn:<host>:<port>,<username>,<credential>, can be repeated,
+//           "none" for host candidates only, default stun:stun.l.google.com:19302
+//   relay   only use TURN relayed candidates
+//   legacy  for devices built before sessions were supported
 const queryString = window.location.search
 const urlParams = new URLSearchParams(queryString)
 const deviceId = urlParams.get("id")
-// every page talks on its own session topics so that the device can serve several browsers,
-// add "&legacy" to the URL for devices built before sessions were supported
+const brokerUrl = urlParams.get("broker") || "wss://broker.emqx.io:8084/mqtt"
+// every page talks on its own session topics so that the device can serve several browsers
 const sessionId = urlParams.has("legacy") ? "" : "/" + Math.random().toString(36).slice(2, 10)
 const resultTopic = "/public/" + deviceId + sessionId + "/result"
 const invokeTopic = "/public/" + deviceId + sessionId + "/invoke"
-const client  = mqtt.connect('wss://broker.emqx.io:8084/mqtt')
+const client  = mqtt.connect(brokerUrl)
+
+function parseIceServer(value) {
+  const [urls, username, credential] = value.split(",")
+  return username === undefined ? { urls } : { urls, username, credential }
+}
+
+function getIceServers() {
+  if (!urlParams.has("ice")) {
+    return [{ urls: "stun:stun.l.google.com:19302" }]
+  }
+  return urlParams.getAll("ice").filter(v => v && v !== "none").map(parseIceServer)
+}
 
 function getRandomItem(array) {
   return array[Math.floor(Math.random() * array.length)];
@@ -136,11 +155,12 @@ function generateRadomId() {
 window.onload = function() {
 
   if (deviceId == undefined) {
-    const randomId = generateRadomId();
-    window.location.href = window.location.href + "?id=" + randomId;
-  } 
+    urlParams.set("id", generateRadomId())
+    window.location.search = urlParams.toString()
+    return
+  }
 
-  document.getElementById("device-url").innerHTML = "mqtts://broker.emqx.io/public/" + deviceId;
+  document.getElementById("device-url").textContent = "mqtts://" + new URL(brokerUrl).hostname + "/public/" + deviceId;
   const canvas = document.createElement('canvas')
   canvas.width = 640
   canvas.height = 480
@@ -160,11 +180,8 @@ var answerId = Math.floor((Math.random() * 1000) + 1);
 var closeId = Math.floor((Math.random() * 1000) + 1);
 
 var pc = new RTCPeerConnection({
-  iceServers: [
-    {
-      urls: "stun:stun.l.google.com:19302",
-    },
-  ],
+  iceServers: getIceServers(),
+  iceTransportPolicy: urlParams.has("relay") ? "relay" : "all",
 });
 
 const datachannel = pc.createDataChannel("libpeer")
