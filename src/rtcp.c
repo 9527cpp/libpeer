@@ -117,6 +117,101 @@ int rtcp_get_report_blocks(uint8_t* packet, size_t len, RtcpReportBlock** blocks
   return count;
 }
 
+int rtcp_get_sender_info(const uint8_t* packet, size_t len, RtcpSenderInfo* info) {
+  const RtcpHeader* header = (const RtcpHeader*)packet;
+  const uint32_t* words = (const uint32_t*)(packet + sizeof(RtcpHeader));
+
+  if (len < 28 || header->type != RTCP_SR) {
+    return -1;
+  }
+
+  info->ssrc = ntohl(words[0]);
+  info->ntp_seconds = ntohl(words[1]);
+  info->ntp_fraction = ntohl(words[2]);
+  info->rtp_timestamp = ntohl(words[3]);
+  info->packet_count = ntohl(words[4]);
+  info->octet_count = ntohl(words[5]);
+  return 0;
+}
+
+int rtcp_get_rr(uint8_t* packet, int len, uint32_t sender_ssrc, const RtcpReportBlock* blocks, int count) {
+  RtcpHeader* header = (RtcpHeader*)packet;
+  int size = 8 + count * (int)sizeof(RtcpReportBlock);
+
+  if (packet == NULL || count < 0 || count > 31 || len < size)
+    return -1;
+
+  rtcp_header_init(header, RTCP_RR, count);
+  header->length = htons(size / 4 - 1);
+  *(uint32_t*)(packet + sizeof(RtcpHeader)) = htonl(sender_ssrc);
+  memcpy(packet + 8, blocks, count * sizeof(RtcpReportBlock));
+  return size;
+}
+
+int rtcp_get_nack(uint8_t* packet, int len, uint32_t sender_ssrc, uint32_t media_ssrc, const uint16_t* seqs, int count) {
+  RtcpFb* nack = (RtcpFb*)packet;
+  uint8_t* fci;
+  uint16_t pid, blp, diff;
+  int i = 0, size = 12;
+
+  if (packet == NULL || count <= 0 || len < 16)
+    return -1;
+
+  rtcp_header_init(&nack->header, RTCP_RTPFB, RTCP_RTPFB_NACK);
+  nack->ssrc = htonl(sender_ssrc);
+  nack->media = htonl(media_ssrc);
+
+  while (i < count && size + 4 <= len) {
+    // PID, and BLP for up to 16 following packets
+    pid = seqs[i++];
+    blp = 0;
+    while (i < count && (diff = (uint16_t)(seqs[i] - pid)) >= 1 && diff <= 16) {
+      blp |= 1 << (diff - 1);
+      i++;
+    }
+    fci = packet + size;
+    fci[0] = pid >> 8;
+    fci[1] = pid & 0xff;
+    fci[2] = blp >> 8;
+    fci[3] = blp & 0xff;
+    size += 4;
+  }
+
+  nack->header.length = htons(size / 4 - 1);
+  return size;
+}
+
+int rtcp_get_remb(uint8_t* packet, int len, uint32_t sender_ssrc, uint32_t bitrate_bps, const uint32_t* ssrcs, int count) {
+  RtcpFb* remb = (RtcpFb*)packet;
+  uint8_t* fci = packet + 12;
+  uint32_t mantissa = bitrate_bps;
+  uint8_t exp = 0;
+  int i, size = 20 + 4 * count;
+
+  if (packet == NULL || count <= 0 || count > 255 || len < size)
+    return -1;
+
+  // bitrate = mantissa (18 bits) * 2^exp (6 bits)
+  while (mantissa > 0x3ffff) {
+    mantissa >>= 1;
+    exp++;
+  }
+
+  rtcp_header_init(&remb->header, RTCP_PSFB, RTCP_PSFB_AFB);
+  remb->header.length = htons(size / 4 - 1);
+  remb->ssrc = htonl(sender_ssrc);
+  remb->media = 0;
+  memcpy(fci, "REMB", 4);
+  fci[4] = (uint8_t)count;
+  fci[5] = (exp << 2) | (mantissa >> 16);
+  fci[6] = (mantissa >> 8) & 0xff;
+  fci[7] = mantissa & 0xff;
+  for (i = 0; i < count; i++) {
+    *(uint32_t*)(fci + 8 + 4 * i) = htonl(ssrcs[i]);
+  }
+  return size;
+}
+
 int rtcp_parse_nack(const uint8_t* packet, size_t len, RtcpNackHandler handler, void* user_data) {
   const uint8_t* fci;
   uint16_t pid, blp;

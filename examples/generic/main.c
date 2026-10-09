@@ -14,11 +14,14 @@ typedef struct Peer {
   int index;
   PeerConnection* pc;
   pthread_t thread;
+  FILE* video_file;
+  size_t video_bytes;
 } Peer;
 
 int g_interrupted = 0;
 Peer g_peers[MAX_PEERS];
 int g_peers_count = 1;
+int g_record = 0;
 
 static void onconnectionstatechange(PeerConnectionState state, void* user_data) {
   Peer* peer = (Peer*)user_data;
@@ -39,6 +42,25 @@ static void onmessage(char* msg, size_t len, void* user_data, uint16_t sid) {
     printf(", send pong\n");
     peer_connection_datachannel_send(peer->pc, "pong", 4);
   }
+}
+
+// called with one Annex B NAL unit at a time
+static void onvideotrack(uint8_t* data, size_t size, void* user_data) {
+  Peer* peer = (Peer*)user_data;
+  char path[32];
+
+  if (!g_record) {
+    return;
+  }
+  if (peer->video_file == NULL) {
+    snprintf(path, sizeof(path), "recv_peer%d.h264", peer->index);
+    if ((peer->video_file = fopen(path, "wb")) == NULL) {
+      return;
+    }
+    printf("[peer %d] recording received video to %s\n", peer->index, path);
+  }
+  fwrite(data, 1, size, peer->video_file);
+  peer->video_bytes += size;
 }
 
 static void onrequestkeyframe(void* user_data) {
@@ -85,7 +107,8 @@ static uint64_t get_timestamp() {
 }
 
 void print_usage(const char* prog_name) {
-  printf("Usage: %s -u <url> [-t <token>] [-n <max peers, 1 ~ %d>]\n", prog_name, MAX_PEERS);
+  printf("Usage: %s -u <url> [-t <token>] [-n <max peers, 1 ~ %d>] [-r]\n", prog_name, MAX_PEERS);
+  printf("  -r  save the video received from peer N to recv_peerN.h264\n");
 }
 
 void parse_arguments(int argc, char* argv[], const char** url, const char** token, int* count) {
@@ -100,6 +123,8 @@ void parse_arguments(int argc, char* argv[], const char** url, const char** toke
       *token = argv[++i];
     } else if (strcmp(argv[i], "-n") == 0 && (i + 1) < argc) {
       *count = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "-r") == 0) {
+      g_record = 1;
     } else {
       print_usage(argv[0]);
       exit(1);
@@ -143,6 +168,7 @@ int main(int argc, char* argv[]) {
       .datachannel = DATA_CHANNEL_STRING,
       .video_codec = CODEC_H264,
       .audio_codec = CODEC_PCMA,
+      .onvideotrack = onvideotrack,
       .on_request_keyframe = onrequestkeyframe};
 
   printf("=========== Parsed Arguments ===========\n");
@@ -210,6 +236,9 @@ int main(int argc, char* argv[]) {
   peer_signaling_disconnect();
   for (i = 0; i < g_peers_count; i++) {
     peer_connection_destroy(g_peers[i].pc);
+    if (g_peers[i].video_file) {
+      fclose(g_peers[i].video_file);
+    }
   }
   peer_deinit();
 

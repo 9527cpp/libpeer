@@ -101,6 +101,23 @@
 #define CONFIG_RTP_HISTORY_SIZE 128
 #endif
 
+// number of received video packets held to put them back in order and wait for the
+// retransmission of lost ones, a power of 2, 0 to disable NACK. Each slot takes about
+// CONFIG_MTU bytes and they are allocated when the remote peer starts sending video.
+#ifndef CONFIG_RTP_JITTER_BUFFER_SIZE
+#define CONFIG_RTP_JITTER_BUFFER_SIZE 128
+#endif
+
+// how long received video waits for a lost packet before giving it up and requesting a key frame
+#ifndef CONFIG_RTP_JITTER_BUFFER_DELAY
+#define CONFIG_RTP_JITTER_BUFFER_DELAY 200
+#endif
+
+// the highest bitrate announced to the remote peer by REMB for the video it sends
+#ifndef CONFIG_REMB_MAX_BITRATE
+#define CONFIG_REMB_MAX_BITRATE 2500000
+#endif
+
 #ifndef CONFIG_MAX_NALU_SIZE
 #define CONFIG_MAX_NALU_SIZE (100 * 1024)  // 100KB
 #endif

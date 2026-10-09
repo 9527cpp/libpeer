@@ -31,7 +31,8 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
-  sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
+  sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
+  sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=ssrc:1 cname:" SDP_CNAME);
   sdp_append(sdp, "a=sendrecv");
@@ -44,6 +45,7 @@ void sdp_append_vp8(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:97 nack");
   sdp_append(sdp, "a=rtcp-fb:97 nack pli");
+  sdp_append(sdp, "a=rtcp-fb:97 goog-remb");
   sdp_append(sdp, "a=rtpmap:97 VP8/90000");
   sdp_append(sdp, "a=ssrc:1 cname:" SDP_CNAME);
   sdp_append(sdp, "a=sendrecv");

@@ -23,6 +23,8 @@ typedef enum RtcpFeedbackType {
   RTCP_RTPFB_NACK = 1,
   RTCP_PSFB_PLI = 1,
   RTCP_PSFB_FIR = 4,
+  // application layer feedback, used by REMB
+  RTCP_PSFB_AFB = 15,
 } RtcpFeedbackType;
 
 typedef struct RtcpHeader {
@@ -114,5 +116,31 @@ int rtcp_get_report_blocks(uint8_t* packet, size_t len, RtcpReportBlock** blocks
  * @return number of requested sequence numbers
  */
 int rtcp_parse_nack(const uint8_t* packet, size_t len, RtcpNackHandler handler, void* user_data);
+
+/**
+ * @brief read the sender information of a single SR packet
+ * @return 0 on success, -1 if it is not a valid SR
+ */
+int rtcp_get_sender_info(const uint8_t* packet, size_t len, RtcpSenderInfo* info);
+
+/**
+ * @brief build a RR packet
+ * @param[in] blocks report blocks in network byte order
+ * @return size of the packet, -1 if the buffer is too small
+ */
+int rtcp_get_rr(uint8_t* packet, int len, uint32_t sender_ssrc, const RtcpReportBlock* blocks, int count);
+
+/**
+ * @brief build a generic NACK (RFC 4585 6.2.1)
+ * @param[in] seqs requested sequence numbers in ascending order
+ * @return size of the packet, -1 if the buffer is too small
+ */
+int rtcp_get_nack(uint8_t* packet, int len, uint32_t sender_ssrc, uint32_t media_ssrc, const uint16_t* seqs, int count);
+
+/**
+ * @brief build a REMB (draft-alvestrand-rmcat-remb) telling the sender the maximum bitrate to use
+ * @return size of the packet, -1 if the buffer is too small
+ */
+int rtcp_get_remb(uint8_t* packet, int len, uint32_t sender_ssrc, uint32_t bitrate_bps, const uint32_t* ssrcs, int count);
 
 #endif  // RTCP_H_

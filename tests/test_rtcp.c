@@ -102,12 +102,73 @@ static void test_history() {
   rtp_history_destroy(history);
 }
 
+static void test_build_nack() {
+  uint8_t packet[64];
+  uint16_t seqs[] = {100, 101, 116, 117, 65535, 0};
+  int len;
+
+  // 100 with 101 and 116 in its BLP, then 117 and 65535 with 0 across the wrap around
+  len = rtcp_get_nack(packet, sizeof(packet), 1, 2, seqs, 6);
+  assert(len == 24);
+  assert(packet[0] == 0x81 && packet[1] == RTCP_RTPFB && ntohs(*(uint16_t*)(packet + 2)) == 5);
+  assert(ntohl(*(uint32_t*)(packet + 4)) == 1 && ntohl(*(uint32_t*)(packet + 8)) == 2);
+
+  g_nack_count = 0;
+  assert(rtcp_parse_nack(packet, len, on_nack, NULL) == 6);
+  assert(g_nack_seqs[0] == 100 && g_nack_seqs[1] == 101 && g_nack_seqs[2] == 116);
+  assert(g_nack_seqs[3] == 117 && g_nack_seqs[4] == 65535 && g_nack_seqs[5] == 0);
+
+  // only the FCIs fitting in the buffer
+  assert(rtcp_get_nack(packet, 16, 1, 2, seqs, 6) == 16);
+}
+
+static void test_rr() {
+  uint8_t packet[64];
+  RtcpReportBlock blocks[2] = {{htonl(3)}, {htonl(4)}};
+  RtcpReportBlock* parsed;
+
+  assert(rtcp_get_rr(packet, sizeof(packet), 1, blocks, 2) == 56);
+  assert(packet[0] == 0x82 && packet[1] == RTCP_RR && ntohs(*(uint16_t*)(packet + 2)) == 13);
+  assert(rtcp_get_report_blocks(packet, 56, &parsed) == 2);
+  assert(ntohl(parsed[0].ssrc) == 3 && ntohl(parsed[1].ssrc) == 4);
+  assert(rtcp_get_rr(packet, 40, 1, blocks, 2) == -1);
+}
+
+static void test_remb() {
+  uint8_t packet[32];
+  uint32_t ssrc = 0x12345678;
+  uint32_t mantissa;
+
+  assert(rtcp_get_remb(packet, sizeof(packet), 1, 2500000, &ssrc, 1) == 24);
+  assert(packet[0] == 0x8f && packet[1] == RTCP_PSFB && ntohs(*(uint16_t*)(packet + 2)) == 5);
+  assert(memcmp(packet + 12, "REMB", 4) == 0 && packet[16] == 1);
+  // 2500000 = 156250 * 2^4
+  mantissa = ((packet[17] & 0x03) << 16) | (packet[18] << 8) | packet[19];
+  assert((packet[17] >> 2) == 4 && mantissa == 156250);
+  assert(ntohl(*(uint32_t*)(packet + 20)) == ssrc);
+}
+
+static void test_sender_info() {
+  uint8_t packet[128];
+  RtcpSenderInfo info = {1, 0xe0000000, 0x80000000, 90000, 10, 12000};
+  RtcpSenderInfo parsed;
+  int len = rtcp_get_sr(packet, sizeof(packet), &info, "libpeer");
+
+  assert(rtcp_get_sender_info(packet, len, &parsed) == 0);
+  assert(memcmp(&parsed, &info, sizeof(info)) == 0);
+  assert(rtcp_get_sender_info(packet, 20, &parsed) == -1);
+}
+
 int main(int argc, char* argv[]) {
   test_pli();
   test_sr();
   test_report_blocks();
   test_nack();
   test_history();
+  test_build_nack();
+  test_rr();
+  test_remb();
+  test_sender_info();
   printf("All RTCP tests passed\n");
   return 0;
 }

@@ -77,8 +77,15 @@ typedef void (*RtpOnPacket)(uint8_t* packet, size_t bytes, void* user_data);
 struct RtpDecoder {
   RtpPayloadType type;
   RtpOnPacket on_packet;
-  int (*decode_func)(RtpDecoder* rtp_decoder, uint8_t* data, size_t size);
+  int (*decode_func)(RtpDecoder* rtp_decoder, const uint8_t* payload, size_t size);
   void* user_data;
+
+  // H264 only: NAL units are assembled here, allocated on the first packet
+  uint8_t* nalu_buf;
+  // size of the fragmented NAL unit being assembled, 0 if none
+  size_t nalu_size;
+  // everything is dropped until the next SPS or IDR after a packet loss
+  int wait_keyframe;
 };
 
 struct RtpEncoder {
@@ -96,6 +103,12 @@ struct RtpEncoder {
 typedef struct RtpHistory RtpHistory;
 
 int rtp_packet_validate(uint8_t* packet, size_t size);
+
+/**
+ * @brief locate the payload of a RTP packet, skipping CSRCs, header extension and padding
+ * @return size of the payload, -1 if the packet is malformed
+ */
+int rtp_get_payload(const uint8_t* packet, size_t size, const uint8_t** payload);
 
 /**
  * @brief create a ring buffer of sent packets indexed by sequence number.
@@ -118,7 +131,17 @@ int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size
 
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 
-int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* data, size_t size);
+void rtp_decoder_deinit(RtpDecoder* rtp_decoder);
+
+/**
+ * @brief drop the frame being assembled and wait for the next key frame, called on packet loss
+ */
+void rtp_decoder_reset(RtpDecoder* rtp_decoder);
+
+/**
+ * @brief decode a RTP packet, packets must be given in sequence number order
+ */
+int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* packet, size_t size);
 
 uint32_t rtp_get_ssrc(uint8_t* packet);
 
