@@ -142,6 +142,11 @@ int32_t ssl_transport_recv(NetworkContext_t* net_ctx, void* buf, size_t len) {
   int ret;
   memset(buf, 0, len);
   ret = mbedtls_ssl_read(&net_ctx->ssl, buf, len);
+  // coreMQTT expects 0 when nothing arrived, a negative value makes it skip the packets
+  // already in its buffer and the keep alive
+  if (ret == MBEDTLS_ERR_SSL_TIMEOUT || ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    return 0;
+  }
 
   return ret;
 }

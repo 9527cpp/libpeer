@@ -823,6 +823,12 @@ int peer_connection_loop(PeerConnection* pc) {
         peer_connection_send_receiver_feedback(pc, now);
       }
 
+      if (pc->config.datachannel && sctp_is_closed(&pc->sctp)) {
+        LOGI("The remote peer closed the SCTP association");
+        STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
+        break;
+      }
+
 #if CONFIG_PEER_CONNECTION_IDLE_TIMEOUT > 0
       if ((uint32_t)(ports_get_epoch_time() - pc->agent.last_recv_time) >= CONFIG_PEER_CONNECTION_IDLE_TIMEOUT) {
         LOGW("Nothing received from the remote peer for %d ms", CONFIG_PEER_CONNECTION_IDLE_TIMEOUT);

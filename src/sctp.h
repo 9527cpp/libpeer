@@ -158,6 +158,7 @@ typedef struct Sctp {
   int local_port;
   int remote_port;
   int connected;
+  int closed;  // the remote peer ended the association, set from the usrsctp threads
   uint32_t verification_tag;
   uint32_t tsn;
   DtlsSrtp* dtls_srtp;
@@ -184,6 +185,12 @@ void sctp_usrsctp_init();
 void sctp_usrsctp_deinit();
 
 int sctp_is_connected(Sctp* sctp);
+
+/**
+ * @brief whether the remote peer aborted or shut down the association. Browsers do this
+ * when the RTCPeerConnection is closed or the page is unloaded.
+ */
+int sctp_is_closed(Sctp* sctp);
 
 void sctp_incoming_data(Sctp* sctp, char* buf, size_t len);
 

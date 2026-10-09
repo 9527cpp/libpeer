@@ -458,6 +458,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
       }
       case SCTP_ABORT:
         sctp->connected = 0;
+        __atomic_store_n(&sctp->closed, 1, __ATOMIC_RELEASE);
         if (sctp->onclose) {
           sctp->onclose(sctp->userdata);
         }
@@ -532,6 +533,7 @@ static void sctp_process_notification(Sctp* sctp, union sctp_notification* notif
         case SCTP_COMM_LOST:
         case SCTP_SHUTDOWN_COMP:
           sctp->connected = 0;
+          __atomic_store_n(&sctp->closed, 1, __ATOMIC_RELEASE);
           if (sctp->onclose) {
             sctp->onclose(sctp->userdata);
           }
@@ -579,6 +581,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
   sctp->tsn = 1234;
+  __atomic_store_n(&sctp->closed, 0, __ATOMIC_RELEASE);
   sctp->stream_count = 0;
   sctp->outgoing_stream_count = 0;
   memset(sctp->outgoing_streams, 0, sizeof(sctp->outgoing_streams));
@@ -724,6 +727,10 @@ void sctp_destroy_association(Sctp* sctp) {
 
 int sctp_is_connected(Sctp* sctp) {
   return sctp->connected;
+}
+
+int sctp_is_closed(Sctp* sctp) {
+  return __atomic_load_n(&sctp->closed, __ATOMIC_ACQUIRE);
 }
 
 void sctp_onmessage(Sctp* sctp, void (*onmessage)(char* msg, size_t len, void* userdata, uint16_t sid)) {

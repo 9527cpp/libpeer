@@ -304,6 +304,7 @@ pc.onicegatheringstatechange = () => {
 client.on('connect', () => {
   console.log("connected")
   client.subscribe(resultTopic, (err) => { })
+  sendPendingClose()
 })
 
 document.getElementById("connect").addEventListener("click", async () => {
@@ -330,18 +331,36 @@ document.getElementById("connect").addEventListener("click", async () => {
   }))
 })
 
-// Browsers send nothing to the remote peer when a tab is closed, so tell the device
-// to release the connection now instead of waiting for its idle timeout.
-window.addEventListener("pagehide", () => {
-  if (pc.connectionState === "new" || pc.connectionState === "closed") {
-    return
-  }
-  client.publish(invokeTopic, JSON.stringify({
+// Only devices with a datachannel notice that the page is gone (SCTP abort), the others
+// wait for their idle timeout, so tell the device to release the connection.
+// The publish is often lost when the page is reloaded, so the next page loaded in this
+// tab repeats it.
+const PENDING_CLOSE_KEY = "libpeer-pending-close"
+
+function sendClose(topic) {
+  client.publish(topic, JSON.stringify({
     jsonrpc: "2.0",
     method: "close",
     id: closeId,
   }))
+}
+
+window.addEventListener("pagehide", () => {
+  if (pc.connectionState === "new" || pc.connectionState === "closed") {
+    return
+  }
+  sessionStorage.setItem(PENDING_CLOSE_KEY, JSON.stringify({ deviceId, invokeTopic }))
+  sendClose(invokeTopic)
 })
+
+function sendPendingClose() {
+  const pending = JSON.parse(sessionStorage.getItem(PENDING_CLOSE_KEY) || "null")
+  sessionStorage.removeItem(PENDING_CLOSE_KEY)
+  if (pending && pending.deviceId === deviceId) {
+    console.log(`close the previous session ${pending.invokeTopic}`)
+    sendClose(pending.invokeTopic)
+  }
+}
 
 const STATS_INTERVAL_MS = 1000
 let lastStats = null
