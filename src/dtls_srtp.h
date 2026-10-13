@@ -54,6 +54,7 @@ typedef struct DtlsSrtp {
   // MbedTLS
   mbedtls_ssl_context ssl;
   mbedtls_ssl_config conf;
+  mbedtls_timing_delay_context timer;
   mbedtls_ssl_cookie_ctx cookie_ctx;
   mbedtls_x509_crt cert;
   mbedtls_pk_context pkey;

@@ -121,7 +121,8 @@ int main(int argc, char* argv[]) {
     usleep(250000);
   }
 
-  if (strcmp(DATACHANNEL_NAME, peer_connection_lookup_sid_label(test_user_data.answer_peer_connection, 0)) != 0) {
+  const char* label = peer_connection_lookup_sid_label(test_user_data.answer_peer_connection, 0);
+  if (label == NULL || strcmp(DATACHANNEL_NAME, label) != 0) {
     return 1;
   }
 

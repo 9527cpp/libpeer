@@ -414,6 +414,8 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
 #endif
   mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+  // flights are retransmitted after 1, 2, 4 and 8 s, the handshake gives up after about 15 s
+  mbedtls_ssl_conf_handshake_timeout(&dtls_srtp->conf, 1000, 8000);
 
   dtls_srtp_x509_digest(&dtls_srtp->cert, dtls_srtp->local_fingerprint);
 
@@ -602,9 +604,7 @@ static void dtls_srtp_key_derivation_cb(void* context,
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   int ret;
 
-  static mbedtls_timing_delay_context timer;
-
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
 
 #if CONFIG_MBEDTLS_2_X
   mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
@@ -662,6 +662,13 @@ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
 
 static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
   int ret;
+
+  // the handshake is retried after a failure
+  ret = mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+  if (ret != 0) {
+    LOGE("mbedtls_ssl_session_reset failed -0x%.4x", (unsigned int)-ret);
+    return ret;
+  }
 
   ret = dtls_srtp_do_handshake(dtls_srtp);
   if (ret != 0) {

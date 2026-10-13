@@ -32,6 +32,8 @@
 // the remote peer is asked for a key frame at most this often while the received video is broken
 #define KEYFRAME_REQUEST_INTERVAL 500
 #define REMB_MIN_BITRATE 100000
+// agent polls (1 ms each) per DTLS read during the handshake, short enough for the DTLS retransmission timer
+#define DTLS_HANDSHAKE_RECV_POLLS 100
 
 typedef struct RtpSenderCounters {
   uint32_t packet_count;
@@ -431,16 +433,19 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     return pc->agent_ret;
   }
 
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CHECKING) {
+  while (recv_max < DTLS_HANDSHAKE_RECV_POLLS && pc->state == PEER_CONNECTION_CHECKING) {
     ret = agent_recv(&pc->agent, buf, len);
 
     if (ret > 0) {
-      break;
+      return ret;
     }
 
     recv_max++;
   }
-  return ret;
+
+  // 0 would be taken for a closed connection, mbedtls calls again after WANT_READ and
+  // retransmits its last flight when the handshake timer expires
+  return pc->state == PEER_CONNECTION_CHECKING ? MBEDTLS_ERR_SSL_WANT_READ : -1;
 }
 
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
@@ -978,6 +983,12 @@ void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, 
   agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
   if (!pc->onlocalcandidate) {
     peer_connection_gather_server_candidates(pc);
+  }
+
+  if (sdp_type == SDP_TYPE_ANSWER) {
+    // the remote offer was set before, check it with the candidates gathered above
+    agent_update_candidate_pairs(&pc->agent);
+    STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
   }
 }
 
