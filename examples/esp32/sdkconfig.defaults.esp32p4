@@ -1,0 +1,14 @@
+# ESP32-P4 overlay, applied on top of sdkconfig.defaults by idf.py set-target esp32p4.
+# Tested with the Waveshare ESP32-P4-ETH: no radio, IP101 Ethernet PHY, no camera.
+
+# The board ships v1.x silicon, a rev 3.x only image does not boot on it
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+CONFIG_EXAMPLE_CONNECT_WIFI=n
+CONFIG_EXAMPLE_CONNECT_ETHERNET=y

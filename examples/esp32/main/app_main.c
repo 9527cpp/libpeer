@@ -11,6 +11,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_tls.h"
 #include "freertos/FreeRTOS.h"
 #include "nvs_flash.h"
@@ -21,6 +22,7 @@
 static const char* TAG = "webrtc";
 
 static TaskHandle_t xPcTaskHandle = NULL;
+#if defined(CONFIG_EXAMPLE_ENABLE_CAMERA)
 static TaskHandle_t xCameraTaskHandle = NULL;
 static TaskHandle_t xAudioTaskHandle = NULL;
 
@@ -28,6 +30,9 @@ extern esp_err_t camera_init();
 extern esp_err_t audio_init();
 extern void camera_task(void* pvParameters);
 extern void audio_task(void* pvParameters);
+#else
+static TaskHandle_t xMessageTaskHandle = NULL;
+#endif
 
 SemaphoreHandle_t xSemaphore = NULL;
 
@@ -52,6 +57,12 @@ static void oniceconnectionstatechange(PeerConnectionState state, void* user_dat
 
 static void onmessage(char* msg, size_t len, void* userdata, uint16_t sid) {
   ESP_LOGI(TAG, "Datachannel message: %.*s", len, msg);
+#if !defined(CONFIG_EXAMPLE_ENABLE_CAMERA)
+  char reply[128];
+  int n = snprintf(reply, sizeof(reply), "echo: %.*s", (int)len, msg);
+  // called from peer_connection_loop, which already holds xSemaphore
+  peer_connection_datachannel_send(g_pc, reply, MIN(n, (int)sizeof(reply) - 1));
+#endif
 }
 
 void onopen(void* userdata) {
@@ -74,6 +85,23 @@ void peer_connection_task(void* arg) {
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
+
+#if !defined(CONFIG_EXAMPLE_ENABLE_CAMERA)
+static void message_task(void* arg) {
+  char msg[64];
+  for (;;) {
+    if (eState == PEER_CONNECTION_CONNECTED && gDataChannelOpened) {
+      int n = snprintf(msg, sizeof(msg), "%s uptime %lld ms, free heap %lu",
+                       CONFIG_IDF_TARGET, esp_timer_get_time() / 1000, (unsigned long)esp_get_free_heap_size());
+      if (xSemaphoreTake(xSemaphore, portMAX_DELAY)) {
+        peer_connection_datachannel_send(g_pc, msg, MIN(n, (int)sizeof(msg) - 1));
+        xSemaphoreGive(xSemaphore);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+#endif
 
 void app_main(void) {
   PeerConfiguration config = {
@@ -104,7 +132,9 @@ void app_main(void) {
 
   peer_init();
 
+#if defined(CONFIG_EXAMPLE_ENABLE_CAMERA)
   camera_init();
+#endif
 
 #if defined(CONFIG_ESP32S3_XIAO_SENSE)
   audio_init();
@@ -123,7 +153,11 @@ void app_main(void) {
   }
 #endif
 
+#if defined(CONFIG_EXAMPLE_ENABLE_CAMERA)
   xTaskCreatePinnedToCore(camera_task, "camera", 4096, NULL, 8, &xCameraTaskHandle, 1);
+#else
+  xTaskCreatePinnedToCore(message_task, "message", 4096, NULL, 6, &xMessageTaskHandle, 1);
+#endif
 
   xTaskCreatePinnedToCore(peer_connection_task, "peer_connection", 8192, NULL, 5, &xPcTaskHandle, 1);
 

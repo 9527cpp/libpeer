@@ -48,26 +48,26 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
                           const char* host,
                           uint16_t port,
                           const char* cacert) {
-  const char* pers = "ssl_client";
   int ret;
   Address resolved_addr;
 
   mbedtls_ssl_init(&net_ctx->ssl);
   mbedtls_ssl_config_init(&net_ctx->conf);
   // mbedtls_x509_crt_init(&net_ctx->cacert);
-  mbedtls_ctr_drbg_init(&net_ctx->ctr_drbg);
-  mbedtls_entropy_init(&net_ctx->entropy);
 
 #if MBEDTLS_VERSION_NUMBER >= 0x04000000
   if (psa_crypto_init() != PSA_SUCCESS) {
     return -1;
   }
-#endif
-
+#else
+  const char* pers = "ssl_client";
+  mbedtls_ctr_drbg_init(&net_ctx->ctr_drbg);
+  mbedtls_entropy_init(&net_ctx->entropy);
   if ((ret = mbedtls_ctr_drbg_seed(&net_ctx->ctr_drbg, mbedtls_entropy_func, &net_ctx->entropy,
                                    (const unsigned char*)pers, strlen(pers))) != 0) {
     return -1;
   }
+#endif
 
   if ((ret = mbedtls_ssl_config_defaults(&net_ctx->conf,
                                          MBEDTLS_SSL_IS_CLIENT,
@@ -131,11 +131,23 @@ int ssl_transport_connect(NetworkContext_t* net_ctx,
 void ssl_transport_disconnect(NetworkContext_t* net_ctx) {
   mbedtls_ssl_config_free(&net_ctx->conf);
   // mbedtls_x509_crt_free(&net_ctx->cacert);
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
   mbedtls_ctr_drbg_free(&net_ctx->ctr_drbg);
   mbedtls_entropy_free(&net_ctx->entropy);
+#endif
   mbedtls_ssl_free(&net_ctx->ssl);
 
   tcp_socket_close(&net_ctx->tcp_socket);
+}
+
+// TLS 1.3 servers send session tickets after the handshake, mbedtls reports each of them
+// from mbedtls_ssl_read/write and the call only has to be repeated
+static int ssl_transport_should_retry(int ret) {
+  return ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE
+#ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+         || ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+#endif
+      ;
 }
 
 int32_t ssl_transport_recv(NetworkContext_t* net_ctx, void* buf, size_t len) {
@@ -144,7 +156,7 @@ int32_t ssl_transport_recv(NetworkContext_t* net_ctx, void* buf, size_t len) {
   ret = mbedtls_ssl_read(&net_ctx->ssl, buf, len);
   // coreMQTT expects 0 when nothing arrived, a negative value makes it skip the packets
   // already in its buffer and the keep alive
-  if (ret == MBEDTLS_ERR_SSL_TIMEOUT || ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+  if (ret == MBEDTLS_ERR_SSL_TIMEOUT || ssl_transport_should_retry(ret)) {
     return 0;
   }
 
@@ -157,7 +169,7 @@ int32_t ssl_transport_send(NetworkContext_t* net_ctx, const void* buf, size_t le
   int retry_count = 0;
   const int max_retry = 5;
   while ((ret = mbedtls_ssl_write(&net_ctx->ssl, buf, len)) <= 0) {
-    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+    if (!ssl_transport_should_retry(ret)) {
       LOGE("ssl write error: -0x%x", (unsigned int)-ret);
     }
 

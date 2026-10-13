@@ -13,11 +13,16 @@ option(PEER_BUILD_ESP_IDF "Build libpeer as an ESP-IDF component" ${PEER_ESP_IDF
 
 if(PEER_BUILD_ESP_IDF)
   file(GLOB ESP32_CODES "./src/*.c")
+  if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    set(PEER_JSON_COMPONENT espressif__cjson)
+  else()
+    set(PEER_JSON_COMPONENT json)
+  endif()
   idf_component_register(
    SRCS ${ESP32_CODES} ${HTTP_SOURCES} ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES}
    INCLUDE_DIRS "./include" ${HTTP_INCLUDE_PUBLIC_DIRS} ${MQTT_INCLUDE_PUBLIC_DIRS}
    PRIV_INCLUDE_DIRS "./src"
-   REQUIRES mbedtls srtp json esp_netif
+   REQUIRES mbedtls srtp ${PEER_JSON_COMPONENT} esp_netif
   )
   add_definitions("-DCONFIG_USE_LWIP=1" "-DCONFIG_USE_USRSCTP=0" "-DCONFIG_AUDIO_BUFFER_SIZE=8096" "-DCONFIG_DATA_BUFFER_SIZE=102400" "-D__BYTE_ORDER=__LITTLE_ENDIAN" "-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" "-DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
   return()
@@ -38,7 +43,11 @@ include_directories(${CMAKE_BINARY_DIR}/dist/include ${CMAKE_BINARY_DIR}/dist/in
 
 link_directories(${CMAKE_BINARY_DIR}/dist/lib)
 
-set(DEP_LIBS "srtp2" "usrsctp" "mbedtls" "mbedcrypto" "mbedx509" "cjson")
+# Full paths, a library of the same name in the sysroot (e.g. an older mbedtls) must not be picked
+set(DEP_LIBS "")
+foreach(dep_lib srtp2 usrsctp mbedtls mbedcrypto mbedx509 cjson)
+  list(APPEND DEP_LIBS ${CMAKE_BINARY_DIR}/dist/lib/lib${dep_lib}.a)
+endforeach()
 # Extended debug information (symbols, source code, and macro definitions)
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
@@ -83,6 +92,8 @@ ExternalProject_Add(cjson
     -DENABLE_CJSON_TEST=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+  BUILD_BYPRODUCTS
+    ${CMAKE_BINARY_DIR}/dist/lib/libcjson.a
 )
 
 ExternalProject_Add(mbedtls
@@ -93,6 +104,10 @@ ExternalProject_Add(mbedtls
     -DENABLE_PROGRAMS=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+  BUILD_BYPRODUCTS
+    ${CMAKE_BINARY_DIR}/dist/lib/libmbedtls.a
+    ${CMAKE_BINARY_DIR}/dist/lib/libmbedcrypto.a
+    ${CMAKE_BINARY_DIR}/dist/lib/libmbedx509.a
 )
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include/mbedtls/mbedtls_config.h INPUT_CONTENT)
 string(REPLACE "//#define MBEDTLS_SSL_DTLS_SRTP" "#define MBEDTLS_SSL_DTLS_SRTP" MODIFIED_CONTENT ${INPUT_CONTENT})
@@ -105,6 +120,8 @@ ExternalProject_Add(srtp2
     -DTEST_APPS=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+  BUILD_BYPRODUCTS
+    ${CMAKE_BINARY_DIR}/dist/lib/libsrtp2.a
 )
 
 ExternalProject_Add(usrsctp
@@ -114,4 +131,6 @@ ExternalProject_Add(usrsctp
     -Dsctp_build_programs=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+  BUILD_BYPRODUCTS
+    ${CMAKE_BINARY_DIR}/dist/lib/libusrsctp.a
 )

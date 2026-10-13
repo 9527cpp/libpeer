@@ -4,15 +4,15 @@
 #ifndef DISABLE_PEER_SIGNALING
 
 #if defined(__has_include)
-#if __has_include(<mbedtls/ctr_drbg.h>)
-#include <mbedtls/ctr_drbg.h>
-#else
+#if __has_include(<mbedtls/private/ctr_drbg.h>)
 #include <mbedtls/private/ctr_drbg.h>
-#endif
-#if __has_include(<mbedtls/entropy.h>)
-#include <mbedtls/entropy.h>
 #else
+#include <mbedtls/ctr_drbg.h>
+#endif
+#if __has_include(<mbedtls/private/entropy.h>)
 #include <mbedtls/private/entropy.h>
+#else
+#include <mbedtls/entropy.h>
 #endif
 #else
 #include <mbedtls/ctr_drbg.h>
@@ -27,8 +27,10 @@
 struct NetworkContext {
   TcpSocket tcp_socket;
   mbedtls_ssl_context ssl;
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context ctr_drbg;
+#endif
   mbedtls_ssl_config conf;
   mbedtls_x509_crt cacert;
 };

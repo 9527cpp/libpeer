@@ -479,7 +479,8 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
             rtp_receiver_on_sr(&pc->areceiver, &sender_info, now);
           }
         }
-        // fall through, a SR carries report blocks as well
+        // a SR carries report blocks as well
+        // fall through
       case RTCP_RR:
         count = rtcp_get_report_blocks(buf + pos, packet_len, &blocks);
         for (i = 0; i < count; i++) {
@@ -1006,6 +1007,8 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
         break;
       case CODEC_VP8:
         sdp_append_vp8(pc->sdp);
+        break;
+      default:
         break;
     }
     sdp_append(pc->sdp, description);

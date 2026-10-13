@@ -335,8 +335,10 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
   mbedtls_x509_crt_init(&dtls_srtp->cert);
   mbedtls_pk_init(&dtls_srtp->pkey);
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
   mbedtls_entropy_init(&dtls_srtp->entropy);
   mbedtls_ctr_drbg_init(&dtls_srtp->ctr_drbg);
+#endif
   dtls_srtp->initialized = 1;
 
 #if MBEDTLS_VERSION_NUMBER >= 0x04000000
@@ -446,14 +448,15 @@ void dtls_srtp_deinit(DtlsSrtp* dtls_srtp) {
 
   mbedtls_x509_crt_free(&dtls_srtp->cert);
   mbedtls_pk_free(&dtls_srtp->pkey);
-  mbedtls_entropy_free(&dtls_srtp->entropy);
-  mbedtls_ctr_drbg_free(&dtls_srtp->ctr_drbg);
 
 #if MBEDTLS_VERSION_NUMBER >= 0x04000000
   if (dtls_srtp->psa_key_id != MBEDTLS_SVC_KEY_ID_INIT) {
     psa_destroy_key(dtls_srtp->psa_key_id);
     dtls_srtp->psa_key_id = MBEDTLS_SVC_KEY_ID_INIT;
   }
+#else
+  mbedtls_entropy_free(&dtls_srtp->entropy);
+  mbedtls_ctr_drbg_free(&dtls_srtp->ctr_drbg);
 #endif
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {

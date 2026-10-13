@@ -5,15 +5,15 @@
 #include <stdlib.h>
 
 #if defined(__has_include)
-#if __has_include(<mbedtls/ctr_drbg.h>)
-#include <mbedtls/ctr_drbg.h>
-#else
+#if __has_include(<mbedtls/private/ctr_drbg.h>)
 #include <mbedtls/private/ctr_drbg.h>
-#endif
-#if __has_include(<mbedtls/entropy.h>)
-#include <mbedtls/entropy.h>
 #else
+#include <mbedtls/ctr_drbg.h>
+#endif
+#if __has_include(<mbedtls/private/entropy.h>)
 #include <mbedtls/private/entropy.h>
+#else
+#include <mbedtls/entropy.h>
 #endif
 #else
 #include <mbedtls/ctr_drbg.h>
@@ -59,9 +59,10 @@ typedef struct DtlsSrtp {
   mbedtls_pk_context pkey;
 #if MBEDTLS_VERSION_NUMBER >= 0x04000000
   mbedtls_svc_key_id_t psa_key_id;
-#endif
+#else
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context ctr_drbg;
+#endif
 
   // SRTP
   srtp_policy_t remote_policy;

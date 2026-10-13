@@ -1,7 +1,16 @@
 menu "Peer Example Configuration"
 
+    config EXAMPLE_ENABLE_CAMERA
+        bool "Stream camera frames over the DataChannel"
+        depends on IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+        default y
+        help
+            Send JPEG frames of an esp32-camera board over the DataChannel. Without it
+            the example only exchanges text messages over the DataChannel.
+
     choice ESP32_CAMERA_MODEL
         prompt "Camera model"
+        depends on EXAMPLE_ENABLE_CAMERA
         default ESP32_EYE
         help
             Select the camera model to use.

@@ -47,3 +47,17 @@ $ idf.py flash
 ### Connect to Your Device
 Back to the test website and click Connect button
 
+## ESP32-P4 (ESP-IDF v6.0)
+Boards without a camera, e.g. the [Waveshare ESP32-P4-ETH](https://www.waveshare.com/esp32-p4-eth.htm), run the example over Ethernet and only use the DataChannel: the device sends its uptime every second and echoes the messages it receives.
+
+```bash
+$ cd libpeer/examples/esp32
+$ idf.py set-target esp32p4
+$ idf.py menuconfig
+# Peer Example Configuration -> Signaling URL
+$ idf.py build
+$ idf.py -p /dev/ttyACM0 flash monitor
+```
+
+[sdkconfig.defaults.esp32p4](sdkconfig.defaults.esp32p4) selects the Ethernet connection (IP101 PHY, MDC 31, MDIO 52, reset 51, the ESP32-P4 defaults of `ethernet_init`) and v1.x silicon, change them under `Example Connection Configuration` / `Ethernet Configuration` and `Component config -> Hardware Settings -> Chip revision` for other boards.
+

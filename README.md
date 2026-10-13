@@ -54,7 +54,15 @@ $ ./build/examples/generic/sample -u <URL> [-n <max viewers>] [-s <ICE server>].
 
   e.g. `?id=mydevice&broker=ws://192.168.1.10:8083/mqtt&ice=turn:192.168.1.10:3478,user,pass`
 
+### OpenWrt Package
+[openwrt/Makefile](openwrt/Makefile) builds the `libpeer` package (`libpeer.so`, the headers for other packages) and `libpeer-sample` (the generic example as `/usr/bin/libpeer-sample`). mbedtls, libsrtp, usrsctp and cJSON are linked statically into `libpeer.so`.
+- Initialize the submodules: `git submodule update --init --recursive`
+- Either symlink the package directory to this tree, `ln -s /path/to/libpeer/openwrt <openwrt>/package/libpeer`, or copy the Makefile and set `LIBPEER_SRC_DIR ?= /path/to/libpeer` in the copy
+- The host python3 needs the `jsonschema` and `jinja2` modules to generate mbedtls sources
+- Select them in `make menuconfig` (menu `Oray`, `CATEGORY` in the Makefile) and run `make package/libpeer/compile V=s`
+- `libpeer-sample` reads `test.264` and `test.wav` from the working directory
+
 ### Examples for Platforms
-- [ESP32](https://github.com/sepfy/libpeer/tree/main/examples/esp32): MJPEG over datachannel
+- [ESP32](https://github.com/sepfy/libpeer/tree/main/examples/esp32): MJPEG over datachannel, text messages over datachannel on ESP32-P4
 - [PICO](https://github.com/sepfy/libpeer/tree/main/examples/pico): Ping pong with datachannel
 - [Raspberry Pi](https://github.com/sepfy/libpeer/tree/main/examples/raspberrypi): Video and two-way audio stream
