@@ -81,12 +81,12 @@ typedef struct PeerConfiguration {
 } PeerConfiguration;
 
 typedef struct PeerReceiverReport {
-  uint32_t ssrc;            // local SSRC of the reported stream
+  uint32_t ssrc;  // local SSRC of the reported stream
   int is_video;
-  float fraction_lost;      // since the previous report, 0.0 ~ 1.0
-  int32_t cumulative_lost;  // packets lost since the beginning
-  uint32_t jitter_ms;       // interarrival jitter
-  int32_t rtt_ms;           // round trip time, -1 if the remote has not received a SR yet
+  float fraction_lost;          // since the previous report, 0.0 ~ 1.0
+  int32_t cumulative_lost;      // packets lost since the beginning
+  uint32_t jitter_ms;           // interarrival jitter
+  int32_t rtt_ms;               // round trip time, -1 if the remote has not received a SR yet
   uint32_t send_bitrate_bps;    // measured since the previous report, 0 if unknown
   uint32_t target_bitrate_bps;  // suggested encoder bitrate based on packet loss, 0 if unknown
 

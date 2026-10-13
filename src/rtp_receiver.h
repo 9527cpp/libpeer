@@ -27,7 +27,7 @@ typedef struct RtpReceiver {
   uint32_t expected_prior;
   uint32_t received_prior;
   uint32_t transit;
-  uint32_t jitter;  // scaled by 16
+  uint32_t jitter;   // scaled by 16
   uint32_t last_sr;  // middle 32 bits of the NTP timestamp of the last SR
   uint32_t last_sr_ms;
   uint32_t octets;
